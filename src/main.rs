@@ -24,7 +24,7 @@ use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
 use librespot_playback::audio_backend;
 use librespot_playback::config::{AudioFormat, PlayerConfig};
-use librespot_playback::mixer::{self, MixerConfig, NoOpVolume};
+use librespot_playback::mixer::{self, MixerConfig};
 use librespot_playback::player::Player;
 
 use ratatui_image::picker::{Picker, ProtocolType};
@@ -60,11 +60,20 @@ struct Track {
     uri: String,
 }
 
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct CachedPlayerState {
+    track_name: String,
+    artist: String,
+    duration_ms: u64,
+    album_art_url: Option<String>,
+}
+
 #[derive(Default, Serialize, Deserialize, Clone)]
 struct AppCache {
     playlists: Vec<Playlist>,
     tracks: HashMap<String, Vec<Track>>,
     last_opened: HashMap<String, u64>,
+    last_player: Option<CachedPlayerState>,
 }
 
 #[derive(Clone)]
@@ -77,6 +86,7 @@ struct PlayerState {
     is_playing: bool,
     volume_percent: u8,
     album_art_url: Option<String>,
+    is_buffering: bool,
 }
 
 // GUI State
@@ -101,6 +111,10 @@ struct AppState {
     current_art_bytes: Option<Vec<u8>>,
     current_art_protocol: Option<StatefulProtocol>,
     picker: Picker,
+    
+    fullscreen_player: bool,
+    local_cmd_tx: Option<mpsc::Sender<LocalPlayerCommand>>,
+    last_action_timestamp: u64,
 }
 
 // Async Message passing
@@ -247,8 +261,14 @@ async fn fetch_user_profile(token: &str) -> Result<(String, String)> {
     Ok((display_name, id))
 }
 
+// Local Player Commands
+enum LocalPlayerCommand {
+    Play,
+    Pause,
+}
+
 // Background Task for Librespot Daemon
-async fn start_librespot_daemon(token: String) -> Result<()> {
+async fn start_librespot_daemon(token: String, mut receiver: mpsc::Receiver<LocalPlayerCommand>) -> Result<()> {
     let credentials = LibrespotCredentials::with_access_token(token);
     let session_config = SessionConfig::default();
     
@@ -258,29 +278,38 @@ async fn start_librespot_daemon(token: String) -> Result<()> {
     let backend = audio_backend::find(None).expect("No audio backend found");
     let player_config = PlayerConfig::default();
     
+    let mixer_fn = mixer::find(Some("softvol")).expect("No softvol mixer found");
+    let mixer_for_player = mixer_fn(MixerConfig::default())?;
+
     let player = Player::new(
         player_config,
         session.clone(),
-        Box::new(NoOpVolume),
+        mixer_for_player.get_soft_volume(),
         move || {
             backend(None, AudioFormat::default())
         },
     );
 
-    let mixer = mixer::find(None).expect("No mixer found");
     let mut connect_config = ConnectConfig::default();
     connect_config.name = "SpotMe Local Player".to_string();
 
-    let (_spirc, spirc_task) = Spirc::new(
+    let (mut spirc, spirc_task) = Spirc::new(
         connect_config,
         session,
         credentials,
         player,
-        mixer(MixerConfig::default())?,
+        mixer_for_player,
     ).await?;
 
-    // Block here to keep the Spotify Connect daemon active internally!
-    spirc_task.await;
+    tokio::spawn(spirc_task);
+    
+    while let Some(cmd) = receiver.recv().await {
+        match cmd {
+            LocalPlayerCommand::Play => { let _ = spirc.play(); },
+            LocalPlayerCommand::Pause => { let _ = spirc.pause(); },
+        }
+    }
+    
     Ok(())
 }
 
@@ -296,11 +325,13 @@ async fn main() -> Result<()> {
     let access_token = get_or_refresh_token(&client_id, &client_secret, &redirect_uri).await?;
     let (display_name, raw_user_id) = fetch_user_profile(&access_token).await?;
 
+    let (cmd_tx, cmd_rx) = mpsc::channel::<LocalPlayerCommand>(10);
+
     // Launch standalone librespot headless local player using our auth token
     if !access_token.is_empty() {
         let t = access_token.clone();
         tokio::spawn(async move {
-            if let Err(e) = start_librespot_daemon(t).await {
+            if let Err(e) = start_librespot_daemon(t, cmd_rx).await {
                 let _ = std::fs::write("/tmp/spotme.log", format!("Librespot error: {}", e));
             }
         });
@@ -338,6 +369,17 @@ async fn main() -> Result<()> {
 
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
+    let initial_player_state = app_cache.last_player.as_ref().map(|cached| PlayerState {
+        track_name: cached.track_name.clone(),
+        artist: cached.artist.clone(),
+        progress_ms: 0,
+        duration_ms: cached.duration_ms,
+        is_playing: false,
+        volume_percent: 50,
+        album_art_url: cached.album_art_url.clone(),
+        is_buffering: false,
+    });
+
     let app_state = AppState {
         display_name,
         user_id,
@@ -347,11 +389,14 @@ async fn main() -> Result<()> {
         playlist_state,
         current_view: View::Playlists,
         access_token,
-        player_state: None,
+        player_state: initial_player_state,
         current_art_url: None,
         current_art_bytes: None,
         current_art_protocol: None,
         picker,
+        fullscreen_player: false,
+        local_cmd_tx: Some(cmd_tx),
+        last_action_timestamp: 0,
     };
 
     // TUI setup
@@ -380,22 +425,28 @@ async fn play_track(token: &str, uri: &str) -> Result<(), anyhow::Error> {
     
     // Find our specific Local SpotMe daemon device to ensure music originates here
     let mut device_id = None;
-    if let Ok(res) = client.get("https://api.spotify.com/v1/me/player/devices")
-        .bearer_auth(token)
-        .send().await 
-    {
-        if let Ok(json) = res.json::<serde_json::Value>().await {
-            if let Some(devices) = json["devices"].as_array() {
-                for dev in devices {
-                    if let Some(name) = dev["name"].as_str() {
-                        if name == "SpotMe Local Player" {
-                            device_id = dev["id"].as_str().map(|s| s.to_string());
-                            break;
+    for _ in 0..5 {
+        if let Ok(res) = client.get("https://api.spotify.com/v1/me/player/devices")
+            .bearer_auth(token)
+            .send().await 
+        {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(devices) = json["devices"].as_array() {
+                    for dev in devices {
+                        if let Some(name) = dev["name"].as_str() {
+                            if name == "SpotMe Local Player" {
+                                device_id = dev["id"].as_str().map(|s| s.to_string());
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
+        if device_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
     }
 
     let mut url = "https://api.spotify.com/v1/me/player/play".to_string();
@@ -548,8 +599,52 @@ async fn set_volume(token: &str, percent: u8) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+fn jump_to_first_match(tracks: &[Track], state: &mut ListState, query: &str) {
+    if query.is_empty() { return; }
+    let q = query.to_lowercase();
+    if let Some(pos) = tracks.iter().position(|t| t.name.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q) || t.album.to_lowercase().contains(&q)) {
+        state.select(Some(pos));
+    }
+}
+
+fn jump_search_next(tracks: &[Track], state: &mut ListState, query: &str, forward: bool) {
+    if query.is_empty() || tracks.is_empty() { return; }
+    let q = query.to_lowercase();
+    let current = state.selected().unwrap_or(0);
+    let len = tracks.len();
+    
+    let iter: Vec<usize> = if forward {
+        (current + 1..len).chain(0..current).collect()
+    } else {
+        (0..current).rev().chain((current + 1..len).rev()).collect()
+    };
+    
+    for i in iter {
+        let t = &tracks[i];
+        if t.name.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q) || t.album.to_lowercase().contains(&q) {
+            state.select(Some(i));
+            break;
+        }
+    }
+}
+
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+
+    if let Some(ref ps) = app_state.player_state {
+        if let Some(ref url) = ps.album_art_url {
+            let art_tx = tx.clone();
+            let art_url = url.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                if let Ok(ares) = client.get(&art_url).send().await {
+                    if let Ok(bytes) = ares.bytes().await {
+                        let _ = art_tx.send(AppMessage::UpdateAlbumArt(art_url, bytes.to_vec()));
+                    }
+                }
+            });
+        }
+    }
 
     // Start background poller for currently playing track
     let poll_token = app_state.access_token.clone();
@@ -577,7 +672,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         let art_url = track_obj["album"]["images"][0]["url"].as_str().map(|s| s.to_string());
                         
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState { 
-                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone()
+                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone(), is_buffering: false
                         })));
                         
                         if let Some(url) = art_url {
@@ -653,8 +748,53 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         is_searching: false,
                     };
                 }
-                AppMessage::UpdatePlayerState(pstate) => {
+                AppMessage::UpdatePlayerState(mut pstate) => {
+                    let now = get_current_unix_time();
+                    
+                    if pstate.is_none() && app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+                        continue;
+                    }
+                    
+                    let is_debounce_active = now.saturating_sub(app_state.last_action_timestamp) < 3;
+                    
+                    if is_debounce_active {
+                        if let Some(ref local_ps) = app_state.player_state {
+                            if let Some(ref incoming_ps) = pstate {
+                                if incoming_ps.track_name != local_ps.track_name {
+                                    continue; // Drop the lagging packet completely to prevent track name flashing!
+                                }
+                            }
+                        }
+                    }
+                    
+                    if is_debounce_active {
+                        if let Some(ref local_ps) = app_state.player_state {
+                            if let Some(ref mut incoming_ps) = pstate {
+                                incoming_ps.is_playing = local_ps.is_playing;
+                                incoming_ps.volume_percent = local_ps.volume_percent;
+                                incoming_ps.progress_ms = local_ps.progress_ms;
+                                incoming_ps.is_buffering = local_ps.is_buffering;
+                            }
+                        }
+                    }
+                    
                     app_state.player_state = pstate;
+                    
+                    if let Some(ref ps) = app_state.player_state {
+                        let cache_changed = match &app_state.app_cache.last_player {
+                            Some(cached) => cached.track_name != ps.track_name,
+                            None => true,
+                        };
+                        if cache_changed {
+                            app_state.app_cache.last_player = Some(CachedPlayerState {
+                                track_name: ps.track_name.clone(),
+                                artist: ps.artist.clone(),
+                                duration_ms: ps.duration_ms,
+                                album_art_url: ps.album_art_url.clone(),
+                            });
+                            save_cache(&app_state.app_cache);
+                        }
+                    }
                 }
                 AppMessage::UpdateAlbumArt(url, bytes) => {
                     app_state.current_art_url = Some(url);
@@ -690,10 +830,20 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         if let Some(player) = &app_state.player_state {
                             let token = app_state.access_token.clone();
                             let is_playing = player.is_playing;
-                            tokio::spawn(async move {
-                                if is_playing { let _ = pause_playback(&token).await; } 
-                                else { let _ = resume_playback(&token).await; }
-                            });
+                            
+                            if is_playing { 
+                                if let Some(tx) = &app_state.local_cmd_tx {
+                                    let _ = tx.try_send(LocalPlayerCommand::Pause);
+                                } else {
+                                    tokio::spawn(async move { let _ = pause_playback(&token).await; });
+                                }
+                            } else { 
+                                if let Some(tx) = &app_state.local_cmd_tx {
+                                    let _ = tx.try_send(LocalPlayerCommand::Play);
+                                } else {
+                                    tokio::spawn(async move { let _ = resume_playback(&token).await; });
+                                }
+                            }
                             app_state.player_state.as_mut().unwrap().is_playing = !is_playing;
                         }
                     }
@@ -760,8 +910,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             tokio::spawn(async move { let _ = set_volume(&token, vol).await; });
                         }
                     }
+                    KeyCode::Char('v') => {
+                        app_state.fullscreen_player = !app_state.fullscreen_player;
+                    }
                     _ => {}
                 }
+                app_state.last_action_timestamp = get_current_unix_time();
                 } // End !is_typing
 
                 // View-specific events
@@ -769,6 +923,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     View::Playlists => {
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                            KeyCode::Char('c') => {
+                                app_state.player_state = None;
+                                app_state.current_art_protocol = None;
+                                app_state.current_art_bytes = None;
+                                app_state.current_art_url = None;
+                                app_state.app_cache.last_player = None;
+                                save_cache(&app_state.app_cache);
+                            }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let i = match app_state.playlist_state.selected() {
                                     Some(i) => if i >= app_state.filtered_playlists.len().saturating_sub(1) { 0 } else { i + 1 },
@@ -831,40 +993,36 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     View::Tracks { playlist_id: ref active_pid, ref mut state, ref tracks, ref mut is_searching, ref mut search_query, .. } => {
                         let inner_pid = active_pid.clone();
                         
-                        let filtered_tracks: Vec<&Track> = tracks.iter().filter(|t| {
-                            let q = search_query.to_lowercase();
-                            q.is_empty() || t.name.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q) || t.album.to_lowercase().contains(&q)
-                        }).collect();
-                        
                         if *is_searching {
                             match key.code {
-                                KeyCode::Esc | KeyCode::Enter => {
+                                KeyCode::Enter => {
                                     *is_searching = false;
-                                    if key.code == KeyCode::Esc {
-                                        search_query.clear();
-                                    }
+                                }
+                                KeyCode::Esc => {
+                                    *is_searching = false;
+                                    search_query.clear();
                                 }
                                 KeyCode::Backspace => {
                                     search_query.pop();
+                                    jump_to_first_match(tracks, state, search_query);
                                 }
                                 KeyCode::Char(c) => {
                                     search_query.push(c);
+                                    jump_to_first_match(tracks, state, search_query);
                                 }
                                 _ => {}
                             }
-                            
-                            let new_len = tracks.iter().filter(|t| {
-                                let q = search_query.to_lowercase();
-                                q.is_empty() || t.name.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q) || t.album.to_lowercase().contains(&q)
-                            }).count();
-                            
-                            if new_len == 0 { state.select(None); }
-                            else if state.selected().is_none() || state.selected().unwrap() >= new_len { state.select(Some(0)); }
                         } else {
                             match key.code {
                                 KeyCode::Char('/') => {
                                     *is_searching = true;
                                     search_query.clear();
+                                }
+                                KeyCode::Char('n') => {
+                                    jump_search_next(tracks, state, search_query, true);
+                                }
+                                KeyCode::Char('N') => {
+                                    jump_search_next(tracks, state, search_query, false);
                                 }
                                 KeyCode::Char('r') => {
                                     let token = app_state.access_token.clone();
@@ -880,29 +1038,52 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     });
                                 }
                                 KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('c') => {
+                                    app_state.player_state = None;
+                                    app_state.current_art_protocol = None;
+                                    app_state.current_art_bytes = None;
+                                    app_state.current_art_url = None;
+                                    app_state.app_cache.last_player = None;
+                                    save_cache(&app_state.app_cache);
+                                }
                                 KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => {
                                     app_state.current_view = View::Playlists;
                                 }
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     let i = match state.selected() {
-                                        Some(i) => if i >= filtered_tracks.len().saturating_sub(1) { 0 } else { i + 1 },
+                                        Some(i) => if i >= tracks.len().saturating_sub(1) { 0 } else { i + 1 },
                                         None => 0,
                                     };
                                     state.select(Some(i));
                                 }
                                 KeyCode::Up | KeyCode::Char('k') => {
                                     let i = match state.selected() {
-                                        Some(i) => if i == 0 { filtered_tracks.len().saturating_sub(1) } else { i - 1 },
+                                        Some(i) => if i == 0 { tracks.len().saturating_sub(1) } else { i - 1 },
                                         None => 0,
                                     };
                                     state.select(Some(i));
                                 }
                                 KeyCode::Enter => {
                                     if let Some(i) = state.selected() {
-                                        if i < filtered_tracks.len() {
+                                        if i < tracks.len() {
                                             let token = app_state.access_token.clone();
-                                            let uri = filtered_tracks[i].uri.clone();
+                                            let track = tracks[i].clone();
+                                            let uri = track.uri.clone();
                                             if !uri.is_empty() {
+                                                // Optimistic instant feedback
+                                                let current_vol = app_state.player_state.as_ref().map(|p| p.volume_percent).unwrap_or(50);
+                                                app_state.player_state = Some(PlayerState {
+                                                    track_name: track.name.clone(),
+                                                    artist: track.artist.clone(),
+                                                    progress_ms: 0,
+                                                    duration_ms: track.duration_ms as u64,
+                                                    is_playing: true,
+                                                    volume_percent: current_vol,
+                                                    album_art_url: None,
+                                                    is_buffering: true,
+                                                });
+                                                app_state.last_action_timestamp = get_current_unix_time();
+
                                                 tokio::spawn(async move {
                                                     let _ = play_track(&token, &uri).await;
                                                 });
@@ -926,23 +1107,36 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 }
 
 fn ui(f: &mut Frame, state: &mut AppState) {
-    let bottom_height = if state.current_art_protocol.is_some() { 14 } else { 3 };
+    let is_vim_cmd = match state.current_view {
+        View::Tracks { is_searching, ref search_query, .. } => is_searching || !search_query.is_empty(),
+        _ => false,
+    };
+
+    let (top, mid, cmd, bot) = if state.fullscreen_player {
+        (0_u16, 0_u16, 0_u16, f.area().height.saturating_sub(4))
+    } else {
+        (3_u16, 1_u16, if is_vim_cmd { 1 } else { 0 }, if state.player_state.is_some() { 14 } else { 3 })
+    };
+    
+    let constraints = if state.fullscreen_player {
+        vec![Constraint::Length(0), Constraint::Length(0), Constraint::Min(1), Constraint::Length(0)]
+    } else {
+        vec![Constraint::Length(top), Constraint::Min(mid), Constraint::Length(bot), Constraint::Length(cmd)]
+    };
+    
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
-        .constraints([
-            Constraint::Length(3), 
-            Constraint::Min(1),
-            Constraint::Length(bottom_height)
-        ])
+        .constraints(constraints)
         .split(f.area());
 
+    if !state.fullscreen_player {
     // Top banner
     let nav_hint = match state.current_view {
-        View::Playlists => "(↑/↓ Nav, +/- Vol, o Others, r Refresh, Enter View, i Mode, q Quit)",
+        View::Playlists => "(↑/↓ Nav, +/- Vol, o Others, r Refresh, Enter View, c Clear, i Mode, q Quit)",
         View::Tracks { is_searching, .. } => {
             if is_searching { "(Type to search, Enter/Esc to exit search)" }
-            else { "(↑/↓ Nav, +/- Vol, / Search, r Sync, Esc Back, Enter PLAY, i Mode, q Quit)" }
+            else { "(↑/↓ Nav, +/- Vol, / Search, r Sync, Esc Back, Enter PLAY, c Clear, i Mode, q Quit)" }
         }
         View::LoadingTracks { .. } => "(Loading...)",
     };
@@ -980,12 +1174,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             f.render_widget(p, chunks[1]);
         }
         View::Tracks { playlist_id: _, playlist_name, tracks, state: list_state, search_query, is_searching } => {
-            let filtered_tracks: Vec<&Track> = tracks.iter().filter(|t| {
-                let q = search_query.to_lowercase();
-                q.is_empty() || t.name.to_lowercase().contains(&q) || t.artist.to_lowercase().contains(&q) || t.album.to_lowercase().contains(&q)
-            }).collect();
-            
-            let items: Vec<ListItem> = filtered_tracks
+            let items: Vec<ListItem> = tracks
                 .iter()
                 .map(|t| {
                     let metadata = format!("{} | {} ({})", t.artist, t.album, format_duration(t.duration_ms));
@@ -995,26 +1184,28 @@ fn ui(f: &mut Frame, state: &mut AppState) {
                 })
                 .collect();
 
-            let mut title_style = Style::default();
-            let title = if *is_searching {
-                title_style = title_style.fg(Color::Yellow);
-                format!("Tracks in {} [Search: {}█]", playlist_name, search_query)
-            } else if !search_query.is_empty() {
-                title_style = title_style.fg(Color::Yellow);
-                format!("Tracks in {} [Search: {}]", playlist_name, search_query)
-            } else {
-                format!("Tracks in {}", playlist_name)
-            };
+            let title = format!("Tracks in {}", playlist_name);
 
             let tracks_list = List::new(items)
-                .block(Block::default().title(Span::styled(title, title_style)).borders(Borders::ALL))
+                .block(Block::default().title(title).borders(Borders::ALL))
                 .style(Style::default().fg(Color::White))
                 .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
                 .highlight_symbol(">> ");
 
             f.render_stateful_widget(tracks_list, chunks[1], list_state);
+            
+            // Render vim command bar in chunks[3]
+            if *is_searching || !search_query.is_empty() {
+                let cursor = if *is_searching { "█" } else { "" };
+                let cmd_text = format!("/{}{}", search_query, cursor);
+                let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
+                if chunks.len() > 3 {
+                    f.render_widget(p, chunks[3]);
+                }
+            }
         }
     }
+    } // End if !state.fullscreen_player
 
     // Bottom Player Box
     let mode_str = match state.picker.protocol_type() {
@@ -1025,8 +1216,9 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     };
     let player_title = format!("Spotify Desktop Remote [{}]", mode_str);
     let player_block = Block::default().borders(Borders::ALL).title(player_title);
-    let inner_area = player_block.inner(chunks[2]);
-    f.render_widget(player_block, chunks[2]);
+    let pdx = 2; // Fixed index now that cmd is at the end
+    let inner_area = player_block.inner(chunks[pdx]);
+    f.render_widget(player_block, chunks[pdx]);
     
     if let Some(player) = &state.player_state {
         let mut sub_chunks = vec![inner_area];
@@ -1045,7 +1237,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         
         let target_area = if sub_chunks.len() > 1 { sub_chunks[1] } else { sub_chunks[0] };
         
-        let status = if player.is_playing { "▶ PLAYING " } else { "⏸ PAUSED  " };
+        let status = if player.is_buffering { "⏳ BUFFERING" } else if player.is_playing { "▶ PLAYING " } else { "⏸ PAUSED  " };
         let info = format!("{} \u{2014} {} [{}] Vol: {}% \u{2014} {} / {}", 
             player.track_name, player.artist, status, player.volume_percent,
             format_duration(player.progress_ms), format_duration(player.duration_ms));
@@ -1062,7 +1254,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             
         f.render_widget(gauge, target_area);
     } else {
-        let text = Paragraph::new(" Booting internal audio decoder. Setting up local Spotify Connect link... 🔊")
+        let text = Paragraph::new("\n  No track currently playing. Select a track and press Enter to begin playback.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(text, inner_area);
     }
