@@ -31,20 +31,33 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 // Models
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Playlist {
     id: String,
     name: String,
+    owner_id: String,
+    collaborative: bool,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Track {
     name: String,
     artist: String,
     album: String,
     duration_ms: u64,
     uri: String,
+}
+
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct AppCache {
+    playlists: Vec<Playlist>,
+    tracks: HashMap<String, Vec<Track>>,
+    last_opened: HashMap<String, u64>,
 }
 
 #[derive(Clone)]
@@ -62,12 +75,15 @@ struct PlayerState {
 enum View {
     Playlists,
     LoadingTracks { spinner_tick: u8 },
-    Tracks { playlist_name: String, tracks: Vec<Track>, state: ListState },
+    Tracks { playlist_id: String, playlist_name: String, tracks: Vec<Track>, state: ListState },
 }
 
 struct AppState {
     display_name: String,
-    playlists: Vec<Playlist>,
+    user_id: String,
+    show_others: bool,
+    app_cache: AppCache,
+    filtered_playlists: Vec<Playlist>,
     playlist_state: ListState,
     current_view: View,
     access_token: String,
@@ -81,10 +97,11 @@ struct AppState {
 
 // Async Message passing
 enum AppMessage {
-    TracksFetched { playlist_name: String, tracks: Vec<Track> },
+    TracksFetched { playlist_id: String, playlist_name: String, tracks: Vec<Track> },
     FetchError(String),
     UpdatePlayerState(Option<PlayerState>),
     UpdateAlbumArt(String, Vec<u8>),
+    PlaylistsRefreshed(Vec<Playlist>),
 }
 
 fn format_duration(ms: u64) -> String {
@@ -92,6 +109,25 @@ fn format_duration(ms: u64) -> String {
     let mins = secs / 60;
     let rem_secs = secs % 60;
     format!("{}:{:02}", mins, rem_secs)
+}
+
+fn load_cache() -> AppCache {
+    if let Ok(content) = std::fs::read_to_string(".spotme_cache.json") {
+        if let Ok(cache) = serde_json::from_str(&content) {
+            return cache;
+        }
+    }
+    AppCache::default()
+}
+
+fn save_cache(cache: &AppCache) {
+    if let Ok(content) = serde_json::to_string(cache) {
+        let _ = std::fs::write(".spotme_cache.json", content);
+    }
+}
+
+fn get_current_unix_time() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
 // Background Task for Librespot Daemon
@@ -184,40 +220,44 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Give the local librespot daemon a second to register with Spotify clouds before we start asking for playlists
-    tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+    // Give the local librespot daemon a second to register with Spotify clouds before we start asking for playlists (async)
+    // Wait! If we have cache, we don't need to block!
+    // tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
-    // Fetch Playlists using raw reqwest
-    let mut playlists = Vec::new();
-    let client = reqwest::Client::new();
-    if !access_token.is_empty() {
-        if let Ok(res) = client.get("https://api.spotify.com/v1/me/playlists")
-            .bearer_auth(&access_token)
-            .send()
-            .await 
-        {
-            if let Ok(json) = res.json::<serde_json::Value>().await {
-                if let Some(items) = json["items"].as_array() {
-                    for item in items {
-                        if let (Some(name), Some(id)) = (item["name"].as_str(), item["id"].as_str()) {
-                            playlists.push(Playlist { name: name.to_string(), id: id.to_string() });
-                        }
-                    }
-                }
-            }
-        }
+    let user_id = user_info.id.to_string();
+
+    let mut app_cache = load_cache();
+    if app_cache.playlists.is_empty() && !access_token.is_empty() {
+        // Block to let daemon register only on explicit first fetch
+        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
+        app_cache.playlists = fetch_playlists_api(&access_token).await;
+        save_cache(&app_cache);
     }
 
+    app_cache.playlists.sort_by(|a, b| {
+        let ta = app_cache.last_opened.get(&a.id).unwrap_or(&0);
+        let tb = app_cache.last_opened.get(&b.id).unwrap_or(&0);
+        tb.cmp(ta)
+    });
+
+    let show_others = false;
+    let filtered_playlists: Vec<Playlist> = app_cache.playlists.iter().filter(|p| {
+        show_others || p.owner_id == user_id || p.collaborative
+    }).cloned().collect();
+
     let mut playlist_state = ListState::default();
-    if !playlists.is_empty() {
-        playlist_state.select(Some(0)); // Start with first selected
+    if !filtered_playlists.is_empty() {
+        playlist_state.select(Some(0));
     }
 
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
     let app_state = AppState {
         display_name,
-        playlists,
+        user_id,
+        show_others,
+        app_cache,
+        filtered_playlists,
         playlist_state,
         current_view: View::Playlists,
         access_token,
@@ -320,6 +360,34 @@ async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Erro
 }
 
 // Track Fetch Hook
+async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
+    let client = reqwest::Client::new();
+    let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
+    let mut out = Vec::new();
+
+    loop {
+        if let Ok(res) = client.get(&url).bearer_auth(token).send().await {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                if let Some(items) = json["items"].as_array() {
+                    for item in items {
+                        if let (Some(name), Some(id)) = (item["name"].as_str(), item["id"].as_str()) {
+                            let owner = item["owner"]["id"].as_str().unwrap_or("unknown").to_string();
+                            let collab = item["collaborative"].as_bool().unwrap_or(false);
+                            out.push(Playlist { name: name.to_string(), id: id.to_string(), owner_id: owner, collaborative: collab });
+                        }
+                    }
+                }
+                if let Some(n) = json["next"].as_str() {
+                    url = n.to_string();
+                } else {
+                    break;
+                }
+            } else { break; }
+        } else { break; }
+    }
+    out
+}
+
 async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, anyhow::Error> {
     let client = reqwest::Client::new();
     let mut url = format!("https://api.spotify.com/v1/playlists/{}/items?market=from_token", playlist_id);
@@ -451,17 +519,40 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         // Process async events incoming
         while let Ok(msg) = rx.try_recv() {
             match msg {
-                AppMessage::TracksFetched { playlist_name, tracks } => {
-                    let mut list_state = ListState::default();
-                    if !tracks.is_empty() {
-                        list_state.select(Some(0));
-                    }
-                    app_state.current_view = View::Tracks { playlist_name, tracks, state: list_state };
+            AppMessage::PlaylistsRefreshed(lists) => {
+                app_state.app_cache.playlists = lists;
+                save_cache(&app_state.app_cache);
+                
+                app_state.app_cache.playlists.sort_by(|a, b| {
+                    let ta = app_state.app_cache.last_opened.get(&a.id).unwrap_or(&0);
+                    let tb = app_state.app_cache.last_opened.get(&b.id).unwrap_or(&0);
+                    tb.cmp(ta)
+                });
+                
+                app_state.filtered_playlists = app_state.app_cache.playlists.iter().filter(|p| {
+                    app_state.show_others || p.owner_id == app_state.user_id || p.collaborative
+                }).cloned().collect();
+                
+                if !app_state.filtered_playlists.is_empty() {
+                    app_state.playlist_state.select(Some(0));
                 }
+            }
+            AppMessage::TracksFetched { playlist_id, playlist_name, tracks } => {
+                app_state.app_cache.tracks.insert(playlist_id.clone(), tracks.clone());
+                app_state.app_cache.last_opened.insert(playlist_id.clone(), get_current_unix_time());
+                save_cache(&app_state.app_cache);
+                
+                let mut list_state = ListState::default();
+                if !tracks.is_empty() {
+                    list_state.select(Some(0));
+                }
+                app_state.current_view = View::Tracks { playlist_id, playlist_name, tracks, state: list_state };
+            }
                 AppMessage::FetchError(err) => {
                     let mut list_state = ListState::default();
                     list_state.select(Some(0));
                     app_state.current_view = View::Tracks {
+                        playlist_id: "error".to_string(),
                         playlist_name: "Error".to_string(),
                         tracks: vec![Track {
                             name: err,
@@ -584,41 +675,80 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                             KeyCode::Down | KeyCode::Char('j') => {
                                 let i = match app_state.playlist_state.selected() {
-                                    Some(i) => if i >= app_state.playlists.len().saturating_sub(1) { 0 } else { i + 1 },
+                                    Some(i) => if i >= app_state.filtered_playlists.len().saturating_sub(1) { 0 } else { i + 1 },
                                     None => 0,
                                 };
                                 app_state.playlist_state.select(Some(i));
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 let i = match app_state.playlist_state.selected() {
-                                    Some(i) => if i == 0 { app_state.playlists.len().saturating_sub(1) } else { i - 1 },
+                                    Some(i) => if i == 0 { app_state.filtered_playlists.len().saturating_sub(1) } else { i - 1 },
                                     None => 0,
                                 };
                                 app_state.playlist_state.select(Some(i));
                             }
+                            KeyCode::Char('o') => {
+                                app_state.show_others = !app_state.show_others;
+                                app_state.filtered_playlists = app_state.app_cache.playlists.iter().filter(|p| {
+                                    app_state.show_others || p.owner_id == app_state.user_id || p.collaborative
+                                }).cloned().collect();
+                                app_state.playlist_state.select(if app_state.filtered_playlists.is_empty() { None } else { Some(0) });
+                            }
+                            KeyCode::Char('r') => {
+                                let tx = tx.clone();
+                                let token = app_state.access_token.clone();
+                                tokio::spawn(async move {
+                                    let lists = fetch_playlists_api(&token).await;
+                                    let _ = tx.send(AppMessage::PlaylistsRefreshed(lists));
+                                });
+                            }
                             KeyCode::Enter => {
                                 if let Some(i) = app_state.playlist_state.selected() {
-                                    let playlist = &app_state.playlists[i];
-                                    app_state.current_view = View::LoadingTracks { spinner_tick: 0 };
-                                    
-                                    let tx = tx.clone();
+                                    let playlist = &app_state.filtered_playlists[i];
                                     let p_id = playlist.id.clone();
                                     let p_name = playlist.name.clone();
                                     let token = app_state.access_token.clone();
                                     
-                                    tokio::spawn(async move {
-                                        match fetch_tracks(token, p_id).await {
-                                            Ok(tracks) => { let _ = tx.send(AppMessage::TracksFetched{ playlist_name: p_name, tracks }); }
-                                            Err(e) => { let _ = tx.send(AppMessage::FetchError(e.to_string())); }
-                                        }
-                                    });
+                                    // Cache fast-path logic!
+                                    if let Some(cached_tracks) = app_state.app_cache.tracks.get(&p_id) {
+                                        app_state.app_cache.last_opened.insert(p_id.clone(), get_current_unix_time());
+                                        save_cache(&app_state.app_cache);
+                                        
+                                        let mut state = ListState::default();
+                                        if !cached_tracks.is_empty() { state.select(Some(0)); }
+                                        app_state.current_view = View::Tracks { playlist_id: p_id, playlist_name: p_name, tracks: cached_tracks.clone(), state };
+                                    } else {
+                                        app_state.current_view = View::LoadingTracks { spinner_tick: 0 };
+                                        let tx = tx.clone();
+                                        tokio::spawn(async move {
+                                            match fetch_tracks(token, p_id.clone()).await {
+                                                Ok(tracks) => { let _ = tx.send(AppMessage::TracksFetched{ playlist_id: p_id, playlist_name: p_name, tracks }); }
+                                                Err(e) => { let _ = tx.send(AppMessage::FetchError(e.to_string())); }
+                                            }
+                                        });
+                                    }
                                 }
                             }
                             _ => {}
                         }
                     }
-                    View::Tracks { ref mut state, ref tracks, .. } => {
+                    View::Tracks { playlist_id: ref active_pid, ref mut state, ref tracks, .. } => {
+                        let inner_pid = active_pid.clone();
                         match key.code {
+                            KeyCode::Char('r') => {
+                                let token = app_state.access_token.clone();
+                                let tx = tx.clone();
+                                let p_id = inner_pid.clone();
+                                // We pull playlist name from filtered if found
+                                let p_name = app_state.filtered_playlists.iter().find(|p| p.id == p_id).map(|p| p.name.clone()).unwrap_or("Tracks".to_string());
+                                app_state.current_view = View::LoadingTracks { spinner_tick: 0 };
+                                tokio::spawn(async move {
+                                    match fetch_tracks(token, p_id.clone()).await {
+                                        Ok(tracks) => { let _ = tx.send(AppMessage::TracksFetched{ playlist_id: p_id, playlist_name: p_name, tracks }); }
+                                        Err(e) => { let _ = tx.send(AppMessage::FetchError(e.to_string())); }
+                                    }
+                                });
+                            }
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => {
                                 app_state.current_view = View::Playlists;
@@ -677,8 +807,8 @@ fn ui(f: &mut Frame, state: &mut AppState) {
 
     // Top banner
     let nav_hint = match state.current_view {
-        View::Playlists => "(↑/↓ Navigate, +/- Vol, Enter View, i Mode, q Quit)",
-        View::Tracks { .. } | View::LoadingTracks { .. } => "(↑/↓ Nav, +/- Vol, Esc Back, Enter PLAY, i Mode, q Quit)",
+        View::Playlists => "(↑/↓ Nav, +/- Vol, o Others, r Refresh, Enter View, i Mode, q Quit)",
+        View::Tracks { .. } | View::LoadingTracks { .. } => "(↑/↓ Nav, +/- Vol, r Sync, Esc Back, Enter PLAY, i Mode, q Quit)",
     };
     
     let welcome_msg = format!("SpotMe Client - Welcome, {}! {}", state.display_name, nav_hint);
@@ -690,7 +820,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     // Active View
     match &mut state.current_view {
         View::Playlists => {
-            let items: Vec<ListItem> = state.playlists
+            let items: Vec<ListItem> = state.filtered_playlists
                 .iter()
                 .map(|p| ListItem::new(p.name.clone()))
                 .collect();
@@ -713,7 +843,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
                 
             f.render_widget(p, chunks[1]);
         }
-        View::Tracks { playlist_name, tracks, state: list_state } => {
+        View::Tracks { playlist_id: _, playlist_name, tracks, state: list_state } => {
             let items: Vec<ListItem> = tracks
                 .iter()
                 .map(|t| {

@@ -19,6 +19,7 @@ librespot-playback = { git = "https://github.com/librespot-org/librespot", versi
 librespot-connect = { git = "https://github.com/librespot-org/librespot", version = "0.8.0" }
 ratatui-image = { version = "10.0.6", default-features = false, features = ["crossterm"] }
 image = { version = "0.25.10", features = ["jpeg", "png"] }
+serde = { version = "1.0.228", features = ["derive"] }
 
 [[bin]]
 name = "spotme"
