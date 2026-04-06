@@ -322,50 +322,64 @@ async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Erro
 // Track Fetch Hook
 async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, anyhow::Error> {
     let client = reqwest::Client::new();
-    let url = format!("https://api.spotify.com/v1/playlists/{}/items?market=from_token", playlist_id);
-    let res = client.get(&url).bearer_auth(token).send().await?;
-    let raw_text = res.text().await?;
-    let json: Value = serde_json::from_str(&raw_text)?;
-    
+    let mut url = format!("https://api.spotify.com/v1/playlists/{}/items?market=from_token", playlist_id);
     let mut tracks = Vec::new();
-    if let Some(items) = json["items"].as_array() {
-        if items.is_empty() {
-            return Err(anyhow::anyhow!("API answered with 0 items."));
-        }
-        for item in items {
-            let mut track_obj = &item["track"];
-            if track_obj.is_null() {
-                track_obj = &item["item"];
+    let mut raw_text_fallback = String::new();
+
+    loop {
+        let res = client.get(&url).bearer_auth(&token).send().await?;
+        let raw_text = res.text().await?;
+        raw_text_fallback = raw_text.clone();
+        let json: Value = serde_json::from_str(&raw_text)?;
+        
+        if let Some(items) = json["items"].as_array() {
+            if items.is_empty() && tracks.is_empty() {
+                return Err(anyhow::anyhow!("API answered with 0 items."));
             }
-            if track_obj.is_null() || !track_obj.is_object() {
-                // Ignore missing tracks (e.g. region blocked)
-                continue; 
-            }
-            
-            let name = track_obj["name"].as_str().unwrap_or("Unknown Track").to_string();
-            let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
-            
-            let mut artists = Vec::new();
-            if let Some(artists_arr) = track_obj["artists"].as_array() {
-                for artist in artists_arr {
-                    if let Some(a_name) = artist["name"].as_str() {
-                        artists.push(a_name.to_string());
+            for item in items {
+                let mut track_obj = &item["track"];
+                if track_obj.is_null() {
+                    track_obj = &item["item"];
+                }
+                if track_obj.is_null() || !track_obj.is_object() {
+                    continue; 
+                }
+                
+                let name = track_obj["name"].as_str().unwrap_or("Unknown Track").to_string();
+                let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
+                
+                let mut artists = Vec::new();
+                if let Some(artists_arr) = track_obj["artists"].as_array() {
+                    for artist in artists_arr {
+                        if let Some(a_name) = artist["name"].as_str() {
+                            artists.push(a_name.to_string());
+                        }
                     }
                 }
+                let artist_str = if artists.is_empty() { "Unknown Artist".to_string() } else { artists.join(", ") };
+                
+                let album = track_obj["album"]["name"].as_str().unwrap_or("Unknown Album").to_string();
+                let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
+                
+                tracks.push(Track { name, artist: artist_str, album, duration_ms, uri });
             }
-            let artist_str = if artists.is_empty() { "Unknown Artist".to_string() } else { artists.join(", ") };
-            
-            let album = track_obj["album"]["name"].as_str().unwrap_or("Unknown Album").to_string();
-            let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
-            
-            tracks.push(Track { name, artist: artist_str, album, duration_ms, uri });
+        } else {
+            if tracks.is_empty() {
+                return Err(anyhow::anyhow!("Failed to parse response payload array. Raw: {}", raw_text));
+            } else {
+                break;
+            }
         }
-    } else {
-        return Err(anyhow::anyhow!("Failed to parse response payload array. Raw: {}", raw_text));
+        
+        if let Some(next_url) = json["next"].as_str() {
+            url = next_url.to_string();
+        } else {
+            break;
+        }
     }
     
     if tracks.is_empty() {
-        return Err(anyhow::anyhow!("Loaded items but found 0 playable tracks! Payload: {}", raw_text.chars().take(2000).collect::<String>()));
+        return Err(anyhow::anyhow!("Loaded items but found 0 playable tracks! Payload: {}", raw_text_fallback.chars().take(2000).collect::<String>()));
     }
     
     Ok(tracks)
