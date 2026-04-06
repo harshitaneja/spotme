@@ -224,7 +224,7 @@ async fn main() -> Result<()> {
     // Wait! If we have cache, we don't need to block!
     // tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
-    let user_id = user_info.id.to_string();
+    let user_id = user_info.id.to_string().replace("spotify:user:", "");
 
     let mut app_cache = load_cache();
     if app_cache.playlists.is_empty() && !access_token.is_empty() {
