@@ -27,6 +27,10 @@ use librespot_playback::config::{AudioFormat, PlayerConfig};
 use librespot_playback::mixer::{self, MixerConfig, NoOpVolume};
 use librespot_playback::player::Player;
 
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
+
 // Models
 #[derive(Clone)]
 struct Playlist {
@@ -50,6 +54,7 @@ struct PlayerState {
     progress_ms: u64,
     duration_ms: u64,
     is_playing: bool,
+    album_art_url: Option<String>,
 }
 
 // GUI State
@@ -66,6 +71,10 @@ struct AppState {
     current_view: View,
     access_token: String,
     player_state: Option<PlayerState>,
+    
+    current_art_url: Option<String>,
+    current_art_protocol: Option<StatefulProtocol>,
+    picker: Picker,
 }
 
 // Async Message passing
@@ -73,6 +82,7 @@ enum AppMessage {
     TracksFetched { playlist_name: String, tracks: Vec<Track> },
     FetchError(String),
     UpdatePlayerState(Option<PlayerState>),
+    UpdateAlbumArt(String, Vec<u8>),
 }
 
 fn format_duration(ms: u64) -> String {
@@ -201,6 +211,8 @@ async fn main() -> Result<()> {
         playlist_state.select(Some(0)); // Start with first selected
     }
 
+    let picker = Picker::halfblocks();
+
     let app_state = AppState {
         display_name,
         playlists,
@@ -208,6 +220,9 @@ async fn main() -> Result<()> {
         current_view: View::Playlists,
         access_token,
         player_state: None,
+        current_art_url: None,
+        current_art_protocol: None,
+        picker,
     };
 
     // TUI setup
@@ -361,6 +376,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
     let poll_tx = tx.clone();
     tokio::spawn(async move {
         let client = reqwest::Client::new();
+        let mut last_art_url: Option<String> = None;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             let res = client.get("https://api.spotify.com/v1/me/player/currently-playing")
@@ -377,10 +393,26 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         let progress = json["progress_ms"].as_u64().unwrap_or(0);
                         let duration = track_obj["duration_ms"].as_u64().unwrap_or(0);
                         let is_playing = json["is_playing"].as_bool().unwrap_or(false);
+                        let art_url = track_obj["album"]["images"][0]["url"].as_str().map(|s| s.to_string());
                         
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState { 
-                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing 
+                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, album_art_url: art_url.clone()
                         })));
+                        
+                        if let Some(url) = art_url {
+                            if last_art_url.as_ref() != Some(&url) {
+                                last_art_url = Some(url.clone());
+                                let art_tx = poll_tx.clone();
+                                let art_client = client.clone();
+                                tokio::spawn(async move {
+                                    if let Ok(ares) = art_client.get(&url).send().await {
+                                        if let Ok(bytes) = ares.bytes().await {
+                                            let _ = art_tx.send(AppMessage::UpdateAlbumArt(url, bytes.to_vec()));
+                                        }
+                                    }
+                                });
+                            }
+                        }
                     } else {
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(None));
                     }
@@ -418,6 +450,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 AppMessage::UpdatePlayerState(pstate) => {
                     app_state.player_state = pstate;
                 }
+                AppMessage::UpdateAlbumArt(url, bytes) => {
+                    app_state.current_art_url = Some(url);
+                    if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+                        let protocol = app_state.picker.new_resize_protocol(dyn_img);
+                        app_state.current_art_protocol = Some(protocol);
+                    }
+                }
             }
         }
 
@@ -427,7 +466,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         }
 
         // Draw UI
-        terminal.draw(|f| ui(f, &mut app_state))?;
+        terminal.draw(|f| ui(f, &mut app_state)).map_err(|_| anyhow::anyhow!("TUI draw error"))?;
 
         // GUI IO Polling logic
         if event::poll(Duration::from_millis(100))? {
@@ -567,14 +606,15 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 }
 
 fn ui(f: &mut Frame, state: &mut AppState) {
+    let bottom_height = if state.current_art_protocol.is_some() { 14 } else { 3 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(2)
         .constraints([
             Constraint::Length(3), 
             Constraint::Min(1),
-            Constraint::Length(3)  // Bottom player
-        ].as_ref())
+            Constraint::Length(bottom_height)
+        ])
         .split(f.size());
 
     // Top banner
@@ -639,7 +679,26 @@ fn ui(f: &mut Frame, state: &mut AppState) {
 
     // Bottom Player Box
     let player_block = Block::default().borders(Borders::ALL).title("Spotify Desktop Remote");
+    let inner_area = player_block.inner(chunks[2]);
+    f.render_widget(player_block, chunks[2]);
+    
     if let Some(player) = &state.player_state {
+        let mut sub_chunks = vec![inner_area];
+        if state.current_art_protocol.is_some() {
+            let split = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(24), Constraint::Min(0)])
+                .split(inner_area);
+            sub_chunks = split.to_vec();
+            
+            if let Some(protocol) = state.current_art_protocol.as_mut() {
+                let img_widget = StatefulImage::default();
+                f.render_stateful_widget(img_widget, sub_chunks[0], protocol);
+            }
+        }
+        
+        let target_area = if sub_chunks.len() > 1 { sub_chunks[1] } else { sub_chunks[0] };
+        
         let status = if player.is_playing { "▶ PLAYING " } else { "⏸ PAUSED  " };
         let info = format!("{} \u{2014} {} [{}] \u{2014} {} / {}", 
             player.track_name, player.artist, status, 
@@ -651,16 +710,14 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         }
         
         let gauge = Gauge::default()
-            .block(player_block)
             .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
             .ratio(progress_ratio)
             .label(Span::styled(info, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
             
-        f.render_widget(gauge, chunks[2]);
+        f.render_widget(gauge, target_area);
     } else {
         let text = Paragraph::new(" Booting internal audio decoder. Setting up local Spotify Connect link... 🔊")
-            .block(player_block)
             .style(Style::default().fg(Color::DarkGray));
-        f.render_widget(text, chunks[2]);
+        f.render_widget(text, inner_area);
     }
 }
