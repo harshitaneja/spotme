@@ -13,8 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Gauge},
     Frame, Terminal,
 };
-use rspotify::{prelude::*, AuthCodeSpotify, Config, OAuth};
 use serde_json::Value;
+use std::io::Write;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
 
@@ -34,6 +34,13 @@ use ratatui_image::StatefulImage;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct SpotifyTokenCache {
+    access_token: String,
+    refresh_token: String,
+    expires_at: u64,
+}
 
 // Models
 #[derive(Clone, Serialize, Deserialize)]
@@ -131,6 +138,115 @@ fn get_current_unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
 }
 
+async fn get_or_refresh_token(client_id: &str, client_secret: &str, redirect_uri: &str) -> Result<String> {
+    let cache_path = ".spotify_token_cache.json";
+    
+    if let Ok(content) = std::fs::read_to_string(cache_path) {
+        if let Ok(cache) = serde_json::from_str::<SpotifyTokenCache>(&content) {
+            if get_current_unix_time() < cache.expires_at {
+                return Ok(cache.access_token);
+            }
+            
+            let client = reqwest::Client::new();
+            let res = client.post("https://accounts.spotify.com/api/token")
+                .basic_auth(client_id, Some(client_secret))
+                .form(&[
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &cache.refresh_token),
+                ])
+                .send()
+                .await;
+                
+            if let Ok(response) = res {
+                if let Ok(json) = response.json::<serde_json::Value>().await {
+                    if let Some(access) = json["access_token"].as_str() {
+                        let refresh = json["refresh_token"].as_str().unwrap_or(&cache.refresh_token);
+                        let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
+                        
+                        let new_cache = SpotifyTokenCache {
+                            access_token: access.to_string(),
+                            refresh_token: refresh.to_string(),
+                            expires_at: get_current_unix_time() + expires_in,
+                        };
+                        
+                        if let Ok(cache_str) = serde_json::to_string(&new_cache) {
+                            let _ = std::fs::write(cache_path, cache_str);
+                        }
+                        return Ok(access.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    let scopes = "user-read-private user-read-email playlist-read-private playlist-read-collaborative user-modify-playback-state user-read-playback-state streaming";
+    let enc_redirect = redirect_uri.replace(":", "%3A").replace("/", "%2F");
+    let enc_scopes = scopes.replace(" ", "%20");
+    
+    let auth_url = format!(
+        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}",
+        client_id, enc_redirect, enc_scopes
+    );
+    
+    println!("Please open this URL in your browser:");
+    println!("{}", auth_url);
+    print!("Paste the redirected URL here: ");
+    std::io::stdout().flush()?;
+    
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    
+    let code = if let Some(idx) = input.find("code=") {
+        input[idx + 5..].split('&').next().unwrap_or("").to_string()
+    } else {
+        return Err(anyhow::anyhow!("Could not find code in URL"));
+    };
+    
+    let client = reqwest::Client::new();
+    let response = client.post("https://accounts.spotify.com/api/token")
+        .basic_auth(client_id, Some(client_secret))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", redirect_uri),
+        ])
+        .send()
+        .await?;
+        
+    let json = response.json::<serde_json::Value>().await?;
+    if let Some(access) = json["access_token"].as_str() {
+        let refresh = json["refresh_token"].as_str().unwrap_or("");
+        let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
+        
+        let new_cache = SpotifyTokenCache {
+            access_token: access.to_string(),
+            refresh_token: refresh.to_string(),
+            expires_at: get_current_unix_time() + expires_in,
+        };
+        
+        if let Ok(cache_str) = serde_json::to_string(&new_cache) {
+            let _ = std::fs::write(cache_path, cache_str);
+        }
+        return Ok(access.to_string());
+    }
+    
+    Err(anyhow::anyhow!("Failed to parse token response: {}", json))
+}
+
+async fn fetch_user_profile(token: &str) -> Result<(String, String)> {
+    let client = reqwest::Client::new();
+    let res = client.get("https://api.spotify.com/v1/me")
+        .bearer_auth(token)
+        .send()
+        .await?;
+        
+    let json = res.json::<serde_json::Value>().await?;
+    let display_name = json["display_name"].as_str().unwrap_or("Unknown").to_string();
+    let id = json["id"].as_str().unwrap_or("").to_string();
+    Ok((display_name, id))
+}
+
 // Background Task for Librespot Daemon
 async fn start_librespot_daemon(token: String) -> Result<()> {
     let credentials = LibrespotCredentials::with_access_token(token);
@@ -177,39 +293,8 @@ async fn main() -> Result<()> {
     let client_secret = env::var("SPOTIFY_CLIENT_SECRET").expect("Missing SPOTIFY_CLIENT_SECRET");
     let redirect_uri = env::var("SPOTIFY_REDIRECT_URI").expect("Missing SPOTIFY_REDIRECT_URI");
 
-    let creds = rspotify::Credentials::new(&client_id, &client_secret);
-    let oauth = OAuth {
-        redirect_uri,
-        scopes: rspotify::scopes!(
-            "user-read-private", 
-            "user-read-email",
-            "playlist-read-private", 
-            "playlist-read-collaborative",
-            "user-modify-playback-state",
-            "user-read-playback-state",
-            "streaming"
-        ),
-        ..Default::default()
-    };
-    
-    let config = Config { token_cached: true, ..Default::default() };
-    let spotify = AuthCodeSpotify::with_config(creds, oauth, config);
-
-    let auth_url = spotify.get_authorize_url(false)?;
-    spotify.prompt_for_token(&auth_url).await?;
-    
-    let user_info = spotify.current_user().await?;
-    let display_name = user_info.display_name.unwrap_or_else(|| "Unknown".to_string());
-
-    // Recover token
-    let mut access_token = String::new();
-    if let Ok(cache_content) = std::fs::read_to_string(".spotify_token_cache.json") {
-        if let Ok(cache_json) = serde_json::from_str::<serde_json::Value>(&cache_content) {
-            if let Some(token) = cache_json["access_token"].as_str() {
-                access_token = token.to_string();
-            }
-        }
-    }
+    let access_token = get_or_refresh_token(&client_id, &client_secret, &redirect_uri).await?;
+    let (display_name, raw_user_id) = fetch_user_profile(&access_token).await?;
 
     // Launch standalone librespot headless local player using our auth token
     if !access_token.is_empty() {
@@ -225,7 +310,7 @@ async fn main() -> Result<()> {
     // Wait! If we have cache, we don't need to block!
     // tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
 
-    let user_id = user_info.id.to_string().replace("spotify:user:", "");
+    let user_id = raw_user_id.replace("spotify:user:", "");
 
     let mut app_cache = load_cache();
     if app_cache.playlists.is_empty() && !access_token.is_empty() {
