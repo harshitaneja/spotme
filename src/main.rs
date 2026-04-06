@@ -110,6 +110,7 @@ struct AppState {
     current_art_url: Option<String>,
     current_art_bytes: Option<Vec<u8>>,
     current_art_protocol: Option<StatefulProtocol>,
+    player_spinner_tick: u8,
     picker: Picker,
     
     fullscreen_player: bool,
@@ -393,6 +394,7 @@ async fn main() -> Result<()> {
         current_art_url: None,
         current_art_bytes: None,
         current_art_protocol: None,
+        player_spinner_tick: 0,
         picker,
         fullscreen_player: false,
         local_cmd_tx: Some(cmd_tx),
@@ -807,9 +809,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
             }
         }
 
-        // Advance spinner if loading
+        // Advance spinners
         if let View::LoadingTracks { ref mut spinner_tick } = app_state.current_view {
             *spinner_tick = spinner_tick.wrapping_add(1);
+        }
+        if app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+            app_state.player_spinner_tick = app_state.player_spinner_tick.wrapping_add(1);
         }
 
         // Draw UI
@@ -1115,7 +1120,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     let (top, mid, cmd, bot) = if state.fullscreen_player {
         (0_u16, 0_u16, 0_u16, f.area().height.saturating_sub(4))
     } else {
-        (3_u16, 1_u16, if is_vim_cmd { 1 } else { 0 }, if state.player_state.is_some() { 14 } else { 3 })
+        (3_u16, 1_u16, if is_vim_cmd { 1 } else { 0 }, if state.player_state.is_some() { 8 } else { 3 })
     };
     
     let constraints = if state.fullscreen_player {
@@ -1208,51 +1213,94 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     } // End if !state.fullscreen_player
 
     // Bottom Player Box
-    let mode_str = match state.picker.protocol_type() {
-        ProtocolType::Halfblocks => "HalfBlocks",
-        ProtocolType::Kitty => "Kitty HD",
-        ProtocolType::Iterm2 => "Iterm2 HD",
-        ProtocolType::Sixel => "Sixel HD",
-    };
-    let player_title = format!("Spotify Desktop Remote [{}]", mode_str);
-    let player_block = Block::default().borders(Borders::ALL).title(player_title);
+    let player_block = Block::default().borders(Borders::ALL);
     let pdx = 2; // Fixed index now that cmd is at the end
     let inner_area = player_block.inner(chunks[pdx]);
     f.render_widget(player_block, chunks[pdx]);
     
     if let Some(player) = &state.player_state {
-        let mut sub_chunks = vec![inner_area];
-        if state.current_art_protocol.is_some() {
-            let split = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Length(24), Constraint::Min(0)])
-                .split(inner_area);
-            sub_chunks = split.to_vec();
-            
-            if let Some(protocol) = state.current_art_protocol.as_mut() {
-                let img_widget = StatefulImage::default();
-                f.render_stateful_widget(img_widget, sub_chunks[0], protocol);
-            }
+        // Always split horizontally to reserve image space, preventing text from shifting left to right
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(16), Constraint::Min(0)])
+            .split(inner_area);
+        let sub_chunks = split.to_vec();
+        
+        if let Some(protocol) = state.current_art_protocol.as_mut() {
+            let img_widget = StatefulImage::default();
+            f.render_stateful_widget(img_widget, sub_chunks[0], protocol);
+        } else {
+            let placeholder = Paragraph::new("\n ░░░░░░\n NO ART\n ░░░░░░")
+                .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                .alignment(ratatui::layout::Alignment::Center);
+            f.render_widget(placeholder, sub_chunks[0]);
         }
         
-        let target_area = if sub_chunks.len() > 1 { sub_chunks[1] } else { sub_chunks[0] };
+        let target_area = sub_chunks[1];
         
-        let status = if player.is_buffering { "⏳ BUFFERING" } else if player.is_playing { "▶ PLAYING " } else { "⏸ PAUSED  " };
-        let info = format!("{} \u{2014} {} [{}] Vol: {}% \u{2014} {} / {}", 
-            player.track_name, player.artist, status, player.volume_percent,
-            format_duration(player.progress_ms), format_duration(player.duration_ms));
+        let detail_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),    // Top pad
+                Constraint::Length(1), // Track Name
+                Constraint::Length(1), // Artist
+                Constraint::Length(1), // Fixed padding
+                Constraint::Length(1), // Gauge
+                Constraint::Length(1), // Status
+            ])
+            .split(target_area);
+
+        let track_name = Paragraph::new(Line::from(vec![
+            Span::styled(player.track_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
+        ]));
         
+        let artist_name = Paragraph::new(Line::from(vec![
+            Span::styled(player.artist.to_uppercase(), Style::default().fg(Color::DarkGray))
+        ]));
+        
+        let status = if player.is_buffering { 
+            let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let idx = (state.player_spinner_tick as usize) % spinners.len();
+            spinners[idx].to_string()
+        } else if player.is_playing { 
+            "⏵".to_string() 
+        } else { 
+            "⏸".to_string() 
+        };
+        
+        let total_vol_blocks = 8;
+        let filled_vol = ((player.volume_percent as u32 * total_vol_blocks) / 100) as usize;
+        let filled_vol = filled_vol.min(total_vol_blocks as usize);
+        let empty_vol = (total_vol_blocks as usize).saturating_sub(filled_vol);
+        let vol_bar = format!("{}{}", "▰".repeat(filled_vol), "▱".repeat(empty_vol));
+        
+        let status_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(0), Constraint::Length(20)])
+            .split(detail_chunks[5]);
+            
+        let left_status = Paragraph::new(format!("{}   {} / {}", 
+            status, format_duration(player.progress_ms), format_duration(player.duration_ms)))
+            .style(Style::default().fg(Color::Gray));
+            
+        let right_status = Paragraph::new(format!("VOL {} {:3}%", vol_bar, player.volume_percent))
+            .style(Style::default().fg(Color::Gray))
+            .alignment(ratatui::layout::Alignment::Right);
+            
         let mut progress_ratio = 0.0;
         if player.duration_ms > 0 {
             progress_ratio = (player.progress_ms as f64 / player.duration_ms as f64).clamp(0.0, 1.0);
         }
         
         let gauge = Gauge::default()
-            .gauge_style(Style::default().fg(Color::Green).bg(Color::Black))
-            .ratio(progress_ratio)
-            .label(Span::styled(info, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray))
+            .ratio(progress_ratio);
             
-        f.render_widget(gauge, target_area);
+        f.render_widget(track_name, detail_chunks[1]);
+        f.render_widget(artist_name, detail_chunks[2]);
+        f.render_widget(gauge, detail_chunks[4]);
+        f.render_widget(left_status, status_split[0]);
+        f.render_widget(right_status, status_split[1]);
     } else {
         let text = Paragraph::new("\n  No track currently playing. Select a track and press Enter to begin playback.")
             .style(Style::default().fg(Color::DarkGray));
