@@ -13,7 +13,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Gauge},
     Frame, Terminal,
 };
-use rspotify::{prelude::*, AuthCodeSpotify, Config, Credentials, OAuth};
+use rspotify::{prelude::*, AuthCodeSpotify, Config, OAuth};
 use serde_json::Value;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
@@ -27,7 +27,7 @@ use librespot_playback::config::{AudioFormat, PlayerConfig};
 use librespot_playback::mixer::{self, MixerConfig, NoOpVolume};
 use librespot_playback::player::Player;
 
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::StatefulImage;
 
@@ -54,6 +54,7 @@ struct PlayerState {
     progress_ms: u64,
     duration_ms: u64,
     is_playing: bool,
+    volume_percent: u8,
     album_art_url: Option<String>,
 }
 
@@ -73,6 +74,7 @@ struct AppState {
     player_state: Option<PlayerState>,
     
     current_art_url: Option<String>,
+    current_art_bytes: Option<Vec<u8>>,
     current_art_protocol: Option<StatefulProtocol>,
     picker: Picker,
 }
@@ -211,7 +213,8 @@ async fn main() -> Result<()> {
         playlist_state.select(Some(0)); // Start with first selected
     }
 
-    let picker = Picker::halfblocks();
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    picker.set_protocol_type(ProtocolType::Halfblocks);
 
     let app_state = AppState {
         display_name,
@@ -221,6 +224,7 @@ async fn main() -> Result<()> {
         access_token,
         player_state: None,
         current_art_url: None,
+        current_art_bytes: None,
         current_art_protocol: None,
         picker,
     };
@@ -368,6 +372,14 @@ async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, 
     Ok(tracks)
 }
 
+async fn set_volume(token: &str, percent: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    client.put(&format!("https://api.spotify.com/v1/me/player/volume?volume_percent={}", percent))
+        .bearer_auth(token)
+        .send().await?;
+    Ok(())
+}
+
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
 
@@ -379,7 +391,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         let mut last_art_url: Option<String> = None;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-            let res = client.get("https://api.spotify.com/v1/me/player/currently-playing")
+            let res = client.get("https://api.spotify.com/v1/me/player")
                 .bearer_auth(&poll_token)
                 .send().await;
             if let Ok(r) = res {
@@ -393,10 +405,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         let progress = json["progress_ms"].as_u64().unwrap_or(0);
                         let duration = track_obj["duration_ms"].as_u64().unwrap_or(0);
                         let is_playing = json["is_playing"].as_bool().unwrap_or(false);
+                        let volume = json["device"]["volume_percent"].as_u64().unwrap_or(100) as u8;
                         let art_url = track_obj["album"]["images"][0]["url"].as_str().map(|s| s.to_string());
                         
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState { 
-                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, album_art_url: art_url.clone()
+                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone()
                         })));
                         
                         if let Some(url) = art_url {
@@ -452,6 +465,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 }
                 AppMessage::UpdateAlbumArt(url, bytes) => {
                     app_state.current_art_url = Some(url);
+                    app_state.current_art_bytes = Some(bytes.clone());
                     if let Ok(dyn_img) = image::load_from_memory(&bytes) {
                         let protocol = app_state.picker.new_resize_protocol(dyn_img);
                         app_state.current_art_protocol = Some(protocol);
@@ -514,6 +528,37 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             let seek_ms = std::cmp::min(player.progress_ms + 15000, player.duration_ms);
                             app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
                             tokio::spawn(async move { let _ = seek_playback(&token, seek_ms).await; });
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        let next = match app_state.picker.protocol_type() {
+                            ProtocolType::Halfblocks => ProtocolType::Kitty,
+                            ProtocolType::Kitty => ProtocolType::Iterm2,
+                            ProtocolType::Iterm2 => ProtocolType::Sixel,
+                            ProtocolType::Sixel => ProtocolType::Halfblocks,
+                        };
+                        app_state.picker.set_protocol_type(next);
+                        if let Some(bytes) = &app_state.current_art_bytes {
+                            if let Ok(dyn_img) = image::load_from_memory(bytes) {
+                                let protocol = app_state.picker.new_resize_protocol(dyn_img);
+                                app_state.current_art_protocol = Some(protocol);
+                            }
+                        }
+                    }
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        if let Some(player) = &app_state.player_state {
+                            let token = app_state.access_token.clone();
+                            let vol = std::cmp::min(player.volume_percent + 5, 100);
+                            app_state.player_state.as_mut().unwrap().volume_percent = vol;
+                            tokio::spawn(async move { let _ = set_volume(&token, vol).await; });
+                        }
+                    }
+                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                        if let Some(player) = &app_state.player_state {
+                            let token = app_state.access_token.clone();
+                            let vol = player.volume_percent.saturating_sub(5);
+                            app_state.player_state.as_mut().unwrap().volume_percent = vol;
+                            tokio::spawn(async move { let _ = set_volume(&token, vol).await; });
                         }
                     }
                     _ => {}
@@ -615,12 +660,12 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             Constraint::Min(1),
             Constraint::Length(bottom_height)
         ])
-        .split(f.size());
+        .split(f.area());
 
     // Top banner
     let nav_hint = match state.current_view {
-        View::Playlists => "(↑/↓ Navigate, Enter View, q Quit)",
-        View::Tracks { .. } | View::LoadingTracks { .. } => "(↑/↓ Nav, Esc Back, Enter PLAY Track!, q Quit)",
+        View::Playlists => "(↑/↓ Navigate, +/- Vol, Enter View, i Mode, q Quit)",
+        View::Tracks { .. } | View::LoadingTracks { .. } => "(↑/↓ Nav, +/- Vol, Esc Back, Enter PLAY, i Mode, q Quit)",
     };
     
     let welcome_msg = format!("SpotMe Client - Welcome, {}! {}", state.display_name, nav_hint);
@@ -678,7 +723,14 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     }
 
     // Bottom Player Box
-    let player_block = Block::default().borders(Borders::ALL).title("Spotify Desktop Remote");
+    let mode_str = match state.picker.protocol_type() {
+        ProtocolType::Halfblocks => "HalfBlocks",
+        ProtocolType::Kitty => "Kitty HD",
+        ProtocolType::Iterm2 => "Iterm2 HD",
+        ProtocolType::Sixel => "Sixel HD",
+    };
+    let player_title = format!("Spotify Desktop Remote [{}]", mode_str);
+    let player_block = Block::default().borders(Borders::ALL).title(player_title);
     let inner_area = player_block.inner(chunks[2]);
     f.render_widget(player_block, chunks[2]);
     
@@ -700,8 +752,8 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         let target_area = if sub_chunks.len() > 1 { sub_chunks[1] } else { sub_chunks[0] };
         
         let status = if player.is_playing { "▶ PLAYING " } else { "⏸ PAUSED  " };
-        let info = format!("{} \u{2014} {} [{}] \u{2014} {} / {}", 
-            player.track_name, player.artist, status, 
+        let info = format!("{} \u{2014} {} [{}] Vol: {}% \u{2014} {} / {}", 
+            player.track_name, player.artist, status, player.volume_percent,
             format_duration(player.progress_ms), format_duration(player.duration_ms));
         
         let mut progress_ratio = 0.0;
