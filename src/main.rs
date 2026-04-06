@@ -1219,10 +1219,15 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     f.render_widget(player_block, chunks[pdx]);
     
     if let Some(player) = &state.player_state {
-        // Always split horizontally to reserve image space, preventing text from shifting left to right
+        let h_split_constraints = if state.fullscreen_player {
+            vec![Constraint::Percentage(50), Constraint::Percentage(50)]
+        } else {
+            vec![Constraint::Length(16), Constraint::Min(0)]
+        };
+        
         let split = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(16), Constraint::Min(0)])
+            .constraints(h_split_constraints)
             .split(inner_area);
         let sub_chunks = split.to_vec();
         
@@ -1230,7 +1235,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             let img_widget = StatefulImage::default();
             f.render_stateful_widget(img_widget, sub_chunks[0], protocol);
         } else {
-            let placeholder = Paragraph::new("\n ░░░░░░\n NO ART\n ░░░░░░")
+            let placeholder = Paragraph::new("\n\n ░░░░░░\n NO ART\n ░░░░░░")
                 .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
                 .alignment(ratatui::layout::Alignment::Center);
             f.render_widget(placeholder, sub_chunks[0]);
@@ -1238,25 +1243,41 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         
         let target_area = sub_chunks[1];
         
-        let detail_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
+        let v_split_constraints = if state.fullscreen_player {
+            vec![
+                Constraint::Percentage(35),
+                Constraint::Length(1), // Track Name
+                Constraint::Length(1), // Artist
+                Constraint::Length(2), // Fixed padding
+                Constraint::Length(1), // Gauge
+                Constraint::Length(1), // Status
+                Constraint::Percentage(35),
+            ]
+        } else {
+            vec![
                 Constraint::Min(1),    // Top pad
                 Constraint::Length(1), // Track Name
                 Constraint::Length(1), // Artist
                 Constraint::Length(1), // Fixed padding
                 Constraint::Length(1), // Gauge
                 Constraint::Length(1), // Status
-            ])
+            ]
+        };
+        
+        let detail_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(v_split_constraints)
             .split(target_area);
+            
+        let align = if state.fullscreen_player { ratatui::layout::Alignment::Center } else { ratatui::layout::Alignment::Left };
 
         let track_name = Paragraph::new(Line::from(vec![
             Span::styled(player.track_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))
-        ]));
+        ])).alignment(align);
         
         let artist_name = Paragraph::new(Line::from(vec![
             Span::styled(player.artist.to_uppercase(), Style::default().fg(Color::DarkGray))
-        ]));
+        ])).alignment(align);
         
         let status = if player.is_buffering { 
             let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
