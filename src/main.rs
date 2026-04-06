@@ -213,8 +213,7 @@ async fn main() -> Result<()> {
         playlist_state.select(Some(0)); // Start with first selected
     }
 
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    picker.set_protocol_type(ProtocolType::Halfblocks);
+    let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
     let app_state = AppState {
         display_name,
