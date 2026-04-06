@@ -24,6 +24,3 @@ serde = { version = "1.0.228", features = ["derive"] }
 name = "spotme"
 path = "src/main.rs"
 
-[[bin]]
-name = "test_librespot"
-path = "src/test_librespot.rs"
