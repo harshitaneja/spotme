@@ -94,6 +94,8 @@ enum View {
     Playlists,
     LoadingTracks { spinner_tick: u8 },
     Tracks { playlist_id: String, playlist_name: String, tracks: Vec<Track>, state: ListState, search_query: String, is_searching: bool },
+    SearchGlobal { query: String, tracks: Option<Vec<Track>>, state: ListState, is_typing: bool },
+    SelectPlaylist { track_uri: String, track_name: String, state: ListState, previous: Box<View> },
 }
 
 struct AppState {
@@ -125,6 +127,9 @@ enum AppMessage {
     UpdatePlayerState(Option<PlayerState>),
     UpdateAlbumArt(String, Vec<u8>),
     PlaylistsRefreshed(Vec<Playlist>),
+    SearchResults(Vec<Track>),
+    SearchError(String),
+    TrackAddedToPlaylist,
 }
 
 fn format_duration(ms: u64) -> String {
@@ -294,7 +299,7 @@ async fn start_librespot_daemon(token: String, mut receiver: mpsc::Receiver<Loca
     let mut connect_config = ConnectConfig::default();
     connect_config.name = "SpotMe Local Player".to_string();
 
-    let (mut spirc, spirc_task) = Spirc::new(
+    let (spirc, spirc_task) = Spirc::new(
         connect_config,
         session,
         credentials,
@@ -593,6 +598,62 @@ async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, 
     Ok(tracks)
 }
 
+async fn search_spotify_api(token: &str, query: &str) -> Vec<Track> {
+    let client = reqwest::Client::new();
+    let safe_query = query.replace(" ", "%20");
+    let url = format!("https://api.spotify.com/v1/search?q={}&type=track&limit=50", safe_query);
+    
+    let res = client.get(&url)
+        .bearer_auth(token)
+        .send()
+        .await;
+        
+    let mut tracks = Vec::new();
+    if let Ok(response) = res {
+        if response.status().is_success() {
+            if let Ok(json) = response.json::<serde_json::Value>().await {
+                if let Some(items) = json["tracks"]["items"].as_array() {
+                    for item in items {
+                        let name = item["name"].as_str().unwrap_or("").to_string();
+                        let uri = item["uri"].as_str().unwrap_or("").to_string();
+                        let duration_ms = item["duration_ms"].as_u64().unwrap_or(0);
+                        
+                        let mut artist_names: Vec<String> = Vec::new();
+                        if let Some(artists) = item["artists"].as_array() {
+                            for a in artists {
+                                if let Some(n) = a["name"].as_str() {
+                                    artist_names.push(n.to_string());
+                                }
+                            }
+                        }
+                        
+                        let album = item["album"]["name"].as_str().unwrap_or("").to_string();
+                        tracks.push(Track { name, artist: artist_names.join(", "), album, duration_ms, uri });
+                    }
+                }
+            }
+        }
+    }
+    tracks
+}
+
+async fn add_track_to_playlist_api(token: &str, playlist_id: &str, track_uri: &str) -> Result<(), anyhow::Error> {
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "uris": [track_uri] });
+    let res = client.post(&format!("https://api.spotify.com/v1/playlists/{}/tracks", playlist_id))
+        .bearer_auth(token)
+        .header("Content-Type", "application/json")
+        .json(&payload)
+        .send()
+        .await?;
+        
+    if res.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!("Failed to add track")
+    }
+}
+
 async fn set_volume(token: &str, percent: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     client.put(&format!("https://api.spotify.com/v1/me/player/volume?volume_percent={}", percent))
@@ -806,8 +867,41 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         app_state.current_art_protocol = Some(protocol);
                     }
                 }
+                AppMessage::SearchResults(tracks) => {
+                let mut list_state = ListState::default();
+                if !tracks.is_empty() {
+                    list_state.select(Some(0));
+                }
+                if let View::SearchGlobal { ref mut query, tracks: ref mut t, state: ref mut s, ref mut is_typing } = app_state.current_view {
+                    *t = Some(tracks);
+                    *s = list_state;
+                    *is_typing = false;
+                } else {
+                    app_state.current_view = View::SearchGlobal {
+                        query: String::new(),
+                        tracks: Some(tracks),
+                        state: list_state,
+                        is_typing: false,
+                    };
+                }
+            }
+            AppMessage::SearchError(err) => {
+                if let View::SearchGlobal { ref mut query, tracks: ref mut tracks, state: ref mut s, ref mut is_typing } = app_state.current_view {
+                    *tracks = Some(vec![Track { name: format!("Error: {}", err), artist: String::new(), album: String::new(), duration_ms: 0, uri: "".to_string() }]);
+                    *is_typing = false;
+                }
+            }
+            AppMessage::TrackAddedToPlaylist => {
+                let mut prev_view = None;
+                if let View::SelectPlaylist { ref mut previous, .. } = app_state.current_view {
+                    prev_view = Some(std::mem::replace(previous, Box::new(View::Playlists)));
+                }
+                if let Some(mut boxed_prev) = prev_view {
+                    std::mem::swap(&mut app_state.current_view, &mut boxed_prev);
+                }
             }
         }
+    }
 
         // Advance spinners
         if let View::LoadingTracks { ref mut spinner_tick } = app_state.current_view {
@@ -943,6 +1037,9 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                 };
                                 app_state.playlist_state.select(Some(i));
                             }
+                            KeyCode::Char('s') => {
+                                app_state.current_view = View::SearchGlobal { query: String::new(), tracks: None, state: ListState::default(), is_typing: true };
+                            }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 let i = match app_state.playlist_state.selected() {
                                     Some(i) => if i == 0 { app_state.filtered_playlists.len().saturating_sub(1) } else { i - 1 },
@@ -1043,6 +1140,21 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     });
                                 }
                                 KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('a') => {
+                                    if let Some(i) = state.selected() {
+                                        if i < tracks.len() {
+                                            let track = tracks[i].clone();
+                                            let mut dummy = View::Playlists;
+                                            std::mem::swap(&mut app_state.current_view, &mut dummy);
+                                            app_state.current_view = View::SelectPlaylist {
+                                                track_uri: track.uri,
+                                                track_name: track.name,
+                                                state: ListState::default().with_selected(if app_state.filtered_playlists.is_empty() { None } else { Some(0) }),
+                                                previous: Box::new(dummy),
+                                            };
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('c') => {
                                     app_state.player_state = None;
                                     app_state.current_art_protocol = None;
@@ -1100,6 +1212,144 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             }
                         }
                     }
+                    View::SearchGlobal { ref mut query, ref mut tracks, ref mut state, ref mut is_typing } => {
+                        if *is_typing {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if !query.trim().is_empty() {
+                                        *is_typing = false;
+                                        let token = app_state.access_token.clone();
+                                        let tx = tx.clone();
+                                        let q = query.clone();
+                                        tokio::spawn(async move {
+                                            let results = search_spotify_api(&token, &q).await;
+                                            let _ = tx.send(AppMessage::SearchResults(results));
+                                        });
+                                    } else {
+                                        *is_typing = false;
+                                    }
+                                }
+                                KeyCode::Esc => {
+                                    app_state.current_view = View::Playlists;
+                                }
+                                KeyCode::Backspace => { query.pop(); }
+                                KeyCode::Char(c) => { query.push(c); }
+                                _ => {}
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc | KeyCode::Char('b') => {
+                                    app_state.current_view = View::Playlists;
+                                }
+                                KeyCode::Char('/') | KeyCode::Char('s') => {
+                                    *is_typing = true;
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    if let Some(t) = tracks {
+                                        let i = match state.selected() {
+                                            Some(i) => if i >= t.len().saturating_sub(1) { 0 } else { i + 1 },
+                                            None => 0,
+                                        };
+                                        state.select(Some(i));
+                                    }
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    if let Some(t) = tracks {
+                                        let i = match state.selected() {
+                                            Some(i) => if i == 0 { t.len().saturating_sub(1) } else { i - 1 },
+                                            None => 0,
+                                        };
+                                        state.select(Some(i));
+                                    }
+                                }
+                                KeyCode::Char('a') => {
+                                    if let Some(t) = tracks {
+                                        if let Some(i) = state.selected() {
+                                            if i < t.len() {
+                                                let track = t[i].clone();
+                                                let mut dummy = View::Playlists;
+                                                std::mem::swap(&mut app_state.current_view, &mut dummy);
+                                                app_state.current_view = View::SelectPlaylist {
+                                                    track_uri: track.uri,
+                                                    track_name: track.name,
+                                                    state: ListState::default().with_selected(if app_state.filtered_playlists.is_empty() { None } else { Some(0) }),
+                                                    previous: Box::new(dummy),
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(t) = tracks {
+                                        if let Some(i) = state.selected() {
+                                            if i < t.len() {
+                                                let token = app_state.access_token.clone();
+                                                let track = t[i].clone();
+                                                let uri = track.uri.clone();
+                                                if !uri.is_empty() {
+                                                    let current_vol = app_state.player_state.as_ref().map(|p| p.volume_percent).unwrap_or(50);
+                                                    app_state.player_state = Some(PlayerState {
+                                                        track_name: track.name.clone(),
+                                                        artist: track.artist.clone(),
+                                                        progress_ms: 0,
+                                                        duration_ms: track.duration_ms as u64,
+                                                        is_playing: true,
+                                                        volume_percent: current_vol,
+                                                        album_art_url: None,
+                                                        is_buffering: true,
+                                                    });
+                                                    app_state.last_action_timestamp = get_current_unix_time();
+                                                    tokio::spawn(async move { let _ = play_track(&token, &uri).await; });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    View::SelectPlaylist { ref track_uri, track_name: _, ref mut state, previous: _ } => {
+                        match key.code {
+                            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char('b') => {
+                                let mut dummy = View::Playlists;
+                                if let View::SelectPlaylist { mut previous, .. } = app_state.current_view {
+                                    std::mem::swap(&mut dummy, &mut previous);
+                                    app_state.current_view = dummy;
+                                }
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                let i = match state.selected() {
+                                    Some(i) => if i >= app_state.filtered_playlists.len().saturating_sub(1) { 0 } else { i + 1 },
+                                    None => 0,
+                                };
+                                state.select(Some(i));
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let i = match state.selected() {
+                                    Some(i) => if i == 0 { app_state.filtered_playlists.len().saturating_sub(1) } else { i - 1 },
+                                    None => 0,
+                                };
+                                state.select(Some(i));
+                            }
+                            KeyCode::Enter => {
+                                if let Some(i) = state.selected() {
+                                    if i < app_state.filtered_playlists.len() {
+                                        let target_list = app_state.filtered_playlists[i].id.clone();
+                                        let uri = track_uri.clone();
+                                        let token = app_state.access_token.clone();
+                                        let tx = tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Ok(_) = add_track_to_playlist_api(&token, &target_list, &uri).await {
+                                                let _ = tx.send(AppMessage::TrackAddedToPlaylist);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                     View::LoadingTracks { .. } => {
                         if let KeyCode::Char('q') | KeyCode::Esc = key.code {
                             return Ok(());
@@ -1114,6 +1364,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 fn ui(f: &mut Frame, state: &mut AppState) {
     let is_vim_cmd = match state.current_view {
         View::Tracks { is_searching, ref search_query, .. } => is_searching || !search_query.is_empty(),
+        View::SearchGlobal { is_typing, ref query, .. } => is_typing || !query.is_empty(),
         _ => false,
     };
 
@@ -1138,11 +1389,16 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     if !state.fullscreen_player {
     // Top banner
     let nav_hint = match state.current_view {
-        View::Playlists => "(↑/↓ Nav, +/- Vol, o Others, r Refresh, Enter View, c Clear, i Mode, q Quit)",
+        View::Playlists => "(↑/↓ Nav, +/- Vol, s Search, o Others, r Refresh, Enter View, i Mode, q Quit)",
         View::Tracks { is_searching, .. } => {
             if is_searching { "(Type to search, Enter/Esc to exit search)" }
-            else { "(↑/↓ Nav, +/- Vol, / Search, r Sync, Esc Back, Enter PLAY, c Clear, i Mode, q Quit)" }
+            else { "(↑/↓ Nav, +/- Vol, / Search, a Add, Esc Edit, Enter PLAY, i Mode, q Quit)" }
         }
+        View::SearchGlobal { is_typing, .. } => {
+            if is_typing { "(Type to search... Enter to search, Esc Back)" }
+            else { "(↑/↓ Nav, Enter PLAY, a Add Playlist, s Search, Esc Back)" }
+        }
+        View::SelectPlaylist { .. } => "(↑/↓ Nav, Enter Select, Esc Back)",
         View::LoadingTracks { .. } => "(Loading...)",
     };
     
@@ -1208,6 +1464,57 @@ fn ui(f: &mut Frame, state: &mut AppState) {
                     f.render_widget(p, chunks[3]);
                 }
             }
+        }
+        View::SearchGlobal { query, tracks, state: list_state, is_typing } => {
+            let title = if *is_typing { "Global Search (Typing...)" } else { "Global Search" };
+            let display_text = if let Some(t) = tracks {
+                if t.is_empty() {
+                    vec![ListItem::new("No results found.")]
+                } else {
+                    t.iter()
+                    .map(|tr| {
+                        let metadata = format!("{} | {} ({})", tr.artist, tr.album, format_duration(tr.duration_ms));
+                        let line1 = Line::from(Span::styled(tr.name.clone(), Style::default().add_modifier(Modifier::BOLD)));
+                        let line2 = Line::from(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
+                        ListItem::new(vec![line1, line2])
+                    })
+                    .collect()
+                }
+            } else {
+                vec![ListItem::new("Enter a query to search Spotify network...")]
+            };
+
+            let tracks_list = List::new(display_text)
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .style(Style::default().fg(Color::White))
+                .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD))
+                .highlight_symbol(">> ");
+
+            f.render_stateful_widget(tracks_list, chunks[1], list_state);
+
+            if *is_typing || !query.is_empty() {
+                let cursor = if *is_typing { "█" } else { "" };
+                let cmd_text = format!("Search: {}{}", query, cursor);
+                let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
+                if chunks.len() > 3 {
+                    f.render_widget(p, chunks[3]);
+                }
+            }
+        }
+        View::SelectPlaylist { track_name, state: list_state, .. } => {
+            let items: Vec<ListItem> = state.filtered_playlists
+                .iter()
+                .map(|p| ListItem::new(p.name.clone()))
+                .collect();
+
+            let title = format!("Add '{}' to Playlist", track_name);
+            let playlist_list = List::new(items)
+                .block(Block::default().title(title).borders(Borders::ALL))
+                .style(Style::default().fg(Color::White))
+                .highlight_style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+                .highlight_symbol(">> ");
+
+            f.render_stateful_widget(playlist_list, chunks[1], list_state);
         }
     }
     } // End if !state.fullscreen_player
