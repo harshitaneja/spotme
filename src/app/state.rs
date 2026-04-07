@@ -2,15 +2,14 @@ use crate::api::models::*;
 use ratatui::widgets::ListState;
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use tokio::sync::mpsc;
 
 pub enum LocalPlayerCommand {
     Play,
     Pause,
 }
-
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct CachedPlayerState {
@@ -52,10 +51,29 @@ pub struct PlayerState {
 // GUI State
 pub enum View {
     Playlists,
-    LoadingTracks { spinner_tick: u8 },
-    Tracks { playlist_id: String, playlist_name: String, tracks: Vec<Track>, state: ListState, search_query: String, is_searching: bool },
-    SearchGlobal { query: String, tracks: Option<Vec<Track>>, state: ListState, is_typing: bool },
-    SelectPlaylist { track_uri: String, track_name: String, state: ListState, previous: Box<View> },
+    LoadingTracks {
+        spinner_tick: u8,
+    },
+    Tracks {
+        playlist_id: String,
+        playlist_name: String,
+        tracks: Vec<Track>,
+        state: ListState,
+        search_query: String,
+        is_searching: bool,
+    },
+    SearchGlobal {
+        query: String,
+        tracks: Option<Vec<Track>>,
+        state: ListState,
+        is_typing: bool,
+    },
+    SelectPlaylist {
+        track_uri: String,
+        track_name: String,
+        state: ListState,
+        previous: Box<View>,
+    },
 }
 
 #[derive(Clone, PartialEq)]
@@ -74,7 +92,7 @@ pub struct AppState {
     pub current_view: View,
     pub access_token: String,
     pub player_state: Option<PlayerState>,
-    
+
     pub current_art_url: Option<String>,
     pub current_art_bytes: Option<Vec<u8>>,
     pub current_art_protocol: Option<StatefulProtocol>,
@@ -92,7 +110,11 @@ pub struct AppState {
 
 // Async Message passing
 pub enum AppMessage {
-    TracksFetched { playlist_id: String, playlist_name: String, tracks: Vec<Track> },
+    TracksFetched {
+        playlist_id: String,
+        playlist_name: String,
+        tracks: Vec<Track>,
+    },
     FetchError(String),
     UpdatePlayerState(Option<PlayerState>),
     UpdateAlbumArt(String, Vec<u8>),
@@ -103,5 +125,8 @@ pub enum AppMessage {
     LyricsLoaded(Result<Lyrics, String>),
     QueueFetched(Result<Vec<Track>, String>),
     FeaturedFetched(Vec<Playlist>),
-    AlbumTracksFetched { album_name: String, tracks: Result<Vec<Track>, String> },
+    AlbumTracksFetched {
+        album_name: String,
+        tracks: Result<Vec<Track>, String>,
+    },
 }

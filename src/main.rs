@@ -1,27 +1,25 @@
 mod api;
 mod app;
 mod config;
-use anyhow::Result;
-use crate::app::state::*;
-use crate::api::models::*;
 use crate::api::endpoints::*;
+use crate::api::models::*;
+use crate::app::state::*;
+use anyhow::Result;
 use crossterm::{
     event::{self, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use dotenvy::dotenv;
+use ratatui::widgets::ListState;
 use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
-use ratatui::widgets::ListState;
 
+use ratatui_image::picker::Picker;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
-use ratatui_image::picker::Picker;
-
-
 
 // Models extracted to src/api/models.rs
 
@@ -48,17 +46,23 @@ fn save_cache(cache: &AppCache) {
 }
 
 pub fn get_current_unix_time() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 pub fn app_log(msg: &str) {
     use std::io::Write;
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&config::paths().log_file) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config::paths().log_file)
+    {
         let ts = get_current_unix_time();
         let _ = writeln!(file, "[{}] {}", ts, msg);
     }
 }
-
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
@@ -86,9 +90,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         let mut last_art_url: Option<String> = None;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-            let res = client.get("https://api.spotify.com/v1/me/player")
+            let res = client
+                .get("https://api.spotify.com/v1/me/player")
                 .bearer_auth(&poll_token)
-                .send().await;
+                .send()
+                .await;
             if let Ok(r) = res {
                 if r.status() == reqwest::StatusCode::NO_CONTENT {
                     let _ = poll_tx.send(AppMessage::UpdatePlayerState(None));
@@ -96,18 +102,33 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     let track_obj = &json["item"];
                     if track_obj.is_object() {
                         let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
-                        let artist = track_obj["artists"][0]["name"].as_str().unwrap_or("Unknown").to_string();
+                        let artist = track_obj["artists"][0]["name"]
+                            .as_str()
+                            .unwrap_or("Unknown")
+                            .to_string();
                         let progress = json["progress_ms"].as_u64().unwrap_or(0);
                         let duration = track_obj["duration_ms"].as_u64().unwrap_or(0);
                         let is_playing = json["is_playing"].as_bool().unwrap_or(false);
                         let volume = json["device"]["volume_percent"].as_u64().unwrap_or(100) as u8;
-                        let art_url = track_obj["album"]["images"][0]["url"].as_str().map(|s| s.to_string());
+                        let art_url = track_obj["album"]["images"][0]["url"]
+                            .as_str()
+                            .map(|s| s.to_string());
                         let uri = track_obj["uri"].as_str().map(|s| s.to_string());
-                        
-                        let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState { 
-                            track_uri: uri, track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone(), is_buffering: false, is_fresh_cache: false, lyrics: None
+
+                        let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState {
+                            track_uri: uri,
+                            track_name: name,
+                            artist,
+                            progress_ms: progress,
+                            duration_ms: duration,
+                            is_playing,
+                            volume_percent: volume,
+                            album_art_url: art_url.clone(),
+                            is_buffering: false,
+                            is_fresh_cache: false,
+                            lyrics: None,
                         })));
-                        
+
                         if let Some(url) = art_url {
                             if last_art_url.as_ref() != Some(&url) {
                                 last_art_url = Some(url.clone());
@@ -116,7 +137,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                 tokio::spawn(async move {
                                     if let Ok(ares) = art_client.get(&url).send().await {
                                         if let Ok(bytes) = ares.bytes().await {
-                                            let _ = art_tx.send(AppMessage::UpdateAlbumArt(url, bytes.to_vec()));
+                                            let _ = art_tx.send(AppMessage::UpdateAlbumArt(
+                                                url,
+                                                bytes.to_vec(),
+                                            ));
                                         }
                                     }
                                 });
@@ -134,35 +158,60 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         // Process async events incoming
         while let Ok(msg) = rx.try_recv() {
             match msg {
-            AppMessage::PlaylistsRefreshed(lists) => {
-                app_state.app_cache.playlists = lists;
-                save_cache(&app_state.app_cache);
-                
-                app_state.app_cache.playlists.sort_by(|a, b| {
-                    let ta = app_state.app_cache.last_opened.get(&a.id).unwrap_or(&0);
-                    let tb = app_state.app_cache.last_opened.get(&b.id).unwrap_or(&0);
-                    tb.cmp(ta)
-                });
-                
-                app_state.filtered_playlists = app_state.app_cache.playlists.iter().filter(|p| {
-                    app_state.show_others || p.owner_id == app_state.user_id || p.collaborative
-                }).cloned().collect();
-                
-                if !app_state.filtered_playlists.is_empty() {
-                    app_state.playlist_state.select(Some(0));
+                AppMessage::PlaylistsRefreshed(lists) => {
+                    app_state.app_cache.playlists = lists;
+                    save_cache(&app_state.app_cache);
+
+                    app_state.app_cache.playlists.sort_by(|a, b| {
+                        let ta = app_state.app_cache.last_opened.get(&a.id).unwrap_or(&0);
+                        let tb = app_state.app_cache.last_opened.get(&b.id).unwrap_or(&0);
+                        tb.cmp(ta)
+                    });
+
+                    app_state.filtered_playlists = app_state
+                        .app_cache
+                        .playlists
+                        .iter()
+                        .filter(|p| {
+                            app_state.show_others
+                                || p.owner_id == app_state.user_id
+                                || p.collaborative
+                        })
+                        .cloned()
+                        .collect();
+
+                    if !app_state.filtered_playlists.is_empty() {
+                        app_state.playlist_state.select(Some(0));
+                    }
                 }
-            }
-            AppMessage::TracksFetched { playlist_id, playlist_name, tracks } => {
-                app_state.app_cache.tracks.insert(playlist_id.clone(), tracks.clone());
-                app_state.app_cache.last_opened.insert(playlist_id.clone(), get_current_unix_time());
-                save_cache(&app_state.app_cache);
-                
-                let mut list_state = ListState::default();
-                if !tracks.is_empty() {
-                    list_state.select(Some(0));
+                AppMessage::TracksFetched {
+                    playlist_id,
+                    playlist_name,
+                    tracks,
+                } => {
+                    app_state
+                        .app_cache
+                        .tracks
+                        .insert(playlist_id.clone(), tracks.clone());
+                    app_state
+                        .app_cache
+                        .last_opened
+                        .insert(playlist_id.clone(), get_current_unix_time());
+                    save_cache(&app_state.app_cache);
+
+                    let mut list_state = ListState::default();
+                    if !tracks.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    app_state.current_view = View::Tracks {
+                        playlist_id,
+                        playlist_name,
+                        tracks,
+                        state: list_state,
+                        search_query: String::new(),
+                        is_searching: false,
+                    };
                 }
-                app_state.current_view = View::Tracks { playlist_id, playlist_name, tracks, state: list_state, search_query: String::new(), is_searching: false };
-            }
                 AppMessage::FetchError(err) => {
                     let mut list_state = ListState::default();
                     list_state.select(Some(0));
@@ -185,7 +234,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 AppMessage::UpdatePlayerState(mut pstate) => {
                     let now = get_current_unix_time();
                     if pstate.is_none() {
-                        if app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+                        if app_state
+                            .player_state
+                            .as_ref()
+                            .map(|p| p.is_buffering)
+                            .unwrap_or(false)
+                        {
                             continue;
                         }
                         if let Some(ref mut local_ps) = app_state.player_state {
@@ -193,9 +247,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         }
                         continue;
                     }
-                    
-                    let is_debounce_active = now.saturating_sub(app_state.last_action_timestamp) < 3;
-                    
+
+                    let is_debounce_active =
+                        now.saturating_sub(app_state.last_action_timestamp) < 3;
+
                     if is_debounce_active {
                         if let Some(ref local_ps) = app_state.player_state {
                             if let Some(ref incoming_ps) = pstate {
@@ -205,7 +260,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             }
                         }
                     }
-                    
+
                     if is_debounce_active {
                         if let Some(ref local_ps) = app_state.player_state {
                             if let Some(ref mut incoming_ps) = pstate {
@@ -216,7 +271,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             }
                         }
                     }
-                    
+
                     if let Some(ref local_ps) = app_state.player_state {
                         if let Some(ref mut incoming_ps) = pstate {
                             if incoming_ps.track_name == local_ps.track_name {
@@ -224,19 +279,21 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             }
                         }
                     }
-                    
+
                     app_state.player_state = pstate;
-                    
+
                     if let Some(ref mut ps) = app_state.player_state {
                         let mut cache_dirty = false;
                         let mut track_changed = false;
-                        
+
                         if let Some(cached) = &mut app_state.app_cache.last_player {
                             if cached.track_name != ps.track_name {
                                 track_changed = true;
                             }
-                            
-                            if track_changed || (ps.progress_ms as i64 - cached.progress_ms as i64).abs() > 5000 {
+
+                            if track_changed
+                                || (ps.progress_ms as i64 - cached.progress_ms as i64).abs() > 5000
+                            {
                                 cached.track_uri = ps.track_uri.clone();
                                 cached.track_name = ps.track_name.clone();
                                 cached.artist = ps.artist.clone();
@@ -259,20 +316,20 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             track_changed = true;
                             cache_dirty = true;
                         }
-                        
+
                         let should_fetch = track_changed || ps.lyrics.is_none();
-                        
+
                         if cache_dirty {
                             save_cache(&app_state.app_cache);
                         }
-                        
+
                         if should_fetch {
                             ps.lyrics = Some(Lyrics::default());
-                            
+
                             if let Some(ref mut cached) = app_state.app_cache.last_player {
                                 cached.lyrics = Some(Lyrics::default());
                             }
-                            
+
                             let t_name = ps.track_name.clone();
                             let t_artist = ps.artist.clone();
                             let tx = tx.clone();
@@ -280,7 +337,8 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                 if let Ok(lyrics) = fetch_lyrics_api(&t_name, &t_artist).await {
                                     let _ = tx.send(AppMessage::LyricsLoaded(Ok(lyrics)));
                                 } else {
-                                    let _ = tx.send(AppMessage::LyricsLoaded(Ok(Lyrics::default())));
+                                    let _ =
+                                        tx.send(AppMessage::LyricsLoaded(Ok(Lyrics::default())));
                                 }
                             });
                         }
@@ -292,131 +350,198 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     if let Ok(dyn_img) = image::load_from_memory(&bytes) {
                         let protocol = app_state.picker.new_resize_protocol(dyn_img.clone());
                         app_state.current_art_protocol = Some(protocol);
-                        
-                        let thumbnail = dyn_img.resize_exact(1, 1, image::imageops::FilterType::Nearest);
+
+                        let thumbnail =
+                            dyn_img.resize_exact(1, 1, image::imageops::FilterType::Nearest);
                         let rgb = thumbnail.to_rgb8();
                         if let Some(pixel) = rgb.pixels().next() {
                             let p = pixel.0;
                             let dampen = 0.5; // Dampen brightness so text remains extremely legible
-                            app_state.dominant_color = Some(((p[0] as f32 * dampen) as u8, (p[1] as f32 * dampen) as u8, (p[2] as f32 * dampen) as u8));
+                            app_state.dominant_color = Some((
+                                (p[0] as f32 * dampen) as u8,
+                                (p[1] as f32 * dampen) as u8,
+                                (p[2] as f32 * dampen) as u8,
+                            ));
                         }
                     }
                 }
                 AppMessage::SearchResults(tracks) => {
-                let mut list_state = ListState::default();
-                if !tracks.is_empty() {
-                    list_state.select(Some(0));
+                    let mut list_state = ListState::default();
+                    if !tracks.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    if let View::SearchGlobal {
+                        query: ref mut _query,
+                        tracks: ref mut t,
+                        state: ref mut s,
+                        ref mut is_typing,
+                    } = app_state.current_view
+                    {
+                        *t = Some(tracks);
+                        *s = list_state;
+                        *is_typing = false;
+                    } else {
+                        app_state.current_view = View::SearchGlobal {
+                            query: String::new(),
+                            tracks: Some(tracks),
+                            state: list_state,
+                            is_typing: false,
+                        };
+                    }
                 }
-                if let View::SearchGlobal { query: ref mut _query, tracks: ref mut t, state: ref mut s, ref mut is_typing } = app_state.current_view {
-                    *t = Some(tracks);
-                    *s = list_state;
-                    *is_typing = false;
-                } else {
-                    app_state.current_view = View::SearchGlobal {
-                        query: String::new(),
-                        tracks: Some(tracks),
+                AppMessage::SearchError(err) => {
+                    if let View::SearchGlobal {
+                        query: ref mut _query,
+                        ref mut tracks,
+                        state: ref mut _s,
+                        ref mut is_typing,
+                    } = app_state.current_view
+                    {
+                        *tracks = Some(vec![Track {
+                            name: format!("Error: {}", err),
+                            artist: String::new(),
+                            album: String::new(),
+                            album_id: None,
+                            duration_ms: 0,
+                            uri: "".to_string(),
+                        }]);
+                        *is_typing = false;
+                    }
+                }
+                AppMessage::TrackAddedToPlaylist(playlist_id) => {
+                    app_log("TRIGGERED TrackAddedToPlaylist UI Popup Return Constraint!");
+
+                    // Discard stale offline cache for this playlist string targeting to force fresh syncs!
+                    app_state.app_cache.tracks.remove(&playlist_id);
+
+                    let mut prev = None;
+                    if let View::SelectPlaylist {
+                        ref mut previous, ..
+                    } = app_state.current_view
+                    {
+                        prev = Some(std::mem::replace(previous, Box::new(View::Playlists)));
+                    }
+                    if let Some(p) = prev {
+                        app_state.current_view = *p;
+                    }
+                }
+                AppMessage::QueueFetched(Ok(tracks)) => {
+                    let mut list_state = ListState::default();
+                    if !tracks.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    app_state.current_view = View::Tracks {
+                        playlist_id: "queue".to_string(),
+                        playlist_name: "Player Queue".to_string(),
+                        tracks,
                         state: list_state,
-                        is_typing: false,
+                        search_query: String::new(),
+                        is_searching: false,
                     };
                 }
-            }
-            AppMessage::SearchError(err) => {
-                if let View::SearchGlobal { query: ref mut _query, ref mut tracks, state: ref mut _s, ref mut is_typing } = app_state.current_view {
-                    *tracks = Some(vec![Track { name: format!("Error: {}", err), artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }]);
-                    *is_typing = false;
+                AppMessage::QueueFetched(Err(err)) => {
+                    let mut list_state = ListState::default();
+                    list_state.select(Some(0));
+                    app_state.current_view = View::Tracks {
+                        playlist_id: "queue_err".to_string(),
+                        playlist_name: "Queue Error".to_string(),
+                        tracks: vec![Track {
+                            name: err,
+                            artist: String::new(),
+                            album: String::new(),
+                            album_id: None,
+                            duration_ms: 0,
+                            uri: "".to_string(),
+                        }],
+                        state: list_state,
+                        search_query: String::new(),
+                        is_searching: false,
+                    };
                 }
-            }
-            AppMessage::TrackAddedToPlaylist(playlist_id) => {
-                app_log("TRIGGERED TrackAddedToPlaylist UI Popup Return Constraint!");
-                
-                // Discard stale offline cache for this playlist string targeting to force fresh syncs!
-                app_state.app_cache.tracks.remove(&playlist_id);
-                
-                let mut prev = None;
-                if let View::SelectPlaylist { ref mut previous, .. } = app_state.current_view {
-                    prev = Some(std::mem::replace(previous, Box::new(View::Playlists)));
+                AppMessage::FeaturedFetched(lists) => {
+                    app_state.app_cache.playlists.extend(lists.clone());
+                    app_state.filtered_playlists = lists;
+                    app_state
+                        .playlist_state
+                        .select(if app_state.filtered_playlists.is_empty() {
+                            None
+                        } else {
+                            Some(0)
+                        });
+                    app_state.current_view = View::Playlists;
                 }
-                if let Some(p) = prev {
-                    app_state.current_view = *p;
+                AppMessage::AlbumTracksFetched {
+                    album_name,
+                    tracks: Ok(tracks),
+                } => {
+                    let mut list_state = ListState::default();
+                    if !tracks.is_empty() {
+                        list_state.select(Some(0));
+                    }
+                    app_state.current_view = View::Tracks {
+                        playlist_id: format!("album_{}", album_name),
+                        playlist_name: album_name,
+                        tracks,
+                        state: list_state,
+                        search_query: String::new(),
+                        is_searching: false,
+                    };
                 }
-            }
-            AppMessage::QueueFetched(Ok(tracks)) => {
-                let mut list_state = ListState::default();
-                if !tracks.is_empty() { list_state.select(Some(0)); }
-                app_state.current_view = View::Tracks {
-                    playlist_id: "queue".to_string(),
-                    playlist_name: "Player Queue".to_string(),
-                    tracks,
-                    state: list_state,
-                    search_query: String::new(),
-                    is_searching: false,
-                };
-            }
-            AppMessage::QueueFetched(Err(err)) => {
-                let mut list_state = ListState::default();
-                list_state.select(Some(0));
-                app_state.current_view = View::Tracks {
-                    playlist_id: "queue_err".to_string(),
-                    playlist_name: "Queue Error".to_string(),
-                    tracks: vec![Track { name: err, artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }],
-                    state: list_state,
-                    search_query: String::new(),
-                    is_searching: false,
-                };
-            }
-            AppMessage::FeaturedFetched(lists) => {
-                app_state.app_cache.playlists.extend(lists.clone());
-                app_state.filtered_playlists = lists;
-                app_state.playlist_state.select(if app_state.filtered_playlists.is_empty() { None } else { Some(0) });
-                app_state.current_view = View::Playlists;
-            }
-            AppMessage::AlbumTracksFetched { album_name, tracks: Ok(tracks) } => {
-                let mut list_state = ListState::default();
-                if !tracks.is_empty() { list_state.select(Some(0)); }
-                app_state.current_view = View::Tracks {
-                    playlist_id: format!("album_{}", album_name),
-                    playlist_name: album_name,
-                    tracks,
-                    state: list_state,
-                    search_query: String::new(),
-                    is_searching: false,
-                };
-            }
-            AppMessage::AlbumTracksFetched { album_name, tracks: Err(err) } => {
-                let mut list_state = ListState::default();
-                list_state.select(Some(0));
-                app_state.current_view = View::Tracks {
-                    playlist_id: format!("album_err_{}", album_name),
-                    playlist_name: format!("Error: {}", album_name),
-                    tracks: vec![Track { name: err, artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }],
-                    state: list_state,
-                    search_query: String::new(),
-                    is_searching: false,
-                };
-            }
-            AppMessage::LyricsLoaded(result) => {
-                let parsed = result.ok();
-                if let Some(ref mut ps) = app_state.player_state {
-                    ps.lyrics = parsed.clone();
+                AppMessage::AlbumTracksFetched {
+                    album_name,
+                    tracks: Err(err),
+                } => {
+                    let mut list_state = ListState::default();
+                    list_state.select(Some(0));
+                    app_state.current_view = View::Tracks {
+                        playlist_id: format!("album_err_{}", album_name),
+                        playlist_name: format!("Error: {}", album_name),
+                        tracks: vec![Track {
+                            name: err,
+                            artist: String::new(),
+                            album: String::new(),
+                            album_id: None,
+                            duration_ms: 0,
+                            uri: "".to_string(),
+                        }],
+                        state: list_state,
+                        search_query: String::new(),
+                        is_searching: false,
+                    };
                 }
-                if let Some(ref mut cached) = app_state.app_cache.last_player {
-                    cached.lyrics = parsed;
-                    save_cache(&app_state.app_cache);
+                AppMessage::LyricsLoaded(result) => {
+                    let parsed = result.ok();
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.lyrics = parsed.clone();
+                    }
+                    if let Some(ref mut cached) = app_state.app_cache.last_player {
+                        cached.lyrics = parsed;
+                        save_cache(&app_state.app_cache);
+                    }
                 }
             }
         }
-    }
 
         // Advance spinners
-        if let View::LoadingTracks { ref mut spinner_tick } = app_state.current_view {
+        if let View::LoadingTracks {
+            ref mut spinner_tick,
+        } = app_state.current_view
+        {
             *spinner_tick = spinner_tick.wrapping_add(1);
         }
-        if app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+        if app_state
+            .player_state
+            .as_ref()
+            .map(|p| p.is_buffering)
+            .unwrap_or(false)
+        {
             app_state.player_spinner_tick = app_state.player_spinner_tick.wrapping_add(1);
         }
 
         // Draw UI
-        terminal.draw(|f| crate::app::ui::ui(f, &mut app_state)).map_err(|_| anyhow::anyhow!("TUI draw error"))?;
+        terminal
+            .draw(|f| crate::app::ui::ui(f, &mut app_state))
+            .map_err(|_| anyhow::anyhow!("TUI draw error"))?;
 
         // GUI IO Polling logic
         if event::poll(Duration::from_millis(100))? {
@@ -429,16 +554,15 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
     }
 }
 
-
-
 #[tokio::main]
 pub async fn main() -> Result<()> {
     dotenv().ok();
-    
+    dotenvy::from_path(&crate::config::paths().env_file).ok();
+
     // Auth Flow
-    let client_id = env::var("SPOTIFY_CLIENT_ID").expect("Missing SPOTIFY_CLIENT_ID");
-    let client_secret = env::var("SPOTIFY_CLIENT_SECRET").expect("Missing SPOTIFY_CLIENT_SECRET");
-    let redirect_uri = env::var("SPOTIFY_REDIRECT_URI").expect("Missing SPOTIFY_REDIRECT_URI");
+    let client_id = env::var("SPOTIFY_CLIENT_ID").unwrap_or_else(|_| "db41158aa95448d6914e73975652b52a".to_string());
+    let client_secret = env::var("SPOTIFY_CLIENT_SECRET").unwrap_or_else(|_| "5df5c5e058d1467cbe8fcd4625180476".to_string());
+    let redirect_uri = env::var("SPOTIFY_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:8480/callback".to_string());
 
     let access_token = get_or_refresh_token(&client_id, &client_secret, &redirect_uri).await?;
     let (display_name, raw_user_id) = fetch_user_profile(&access_token).await?;
@@ -450,7 +574,10 @@ pub async fn main() -> Result<()> {
         let t = access_token.clone();
         tokio::spawn(async move {
             if let Err(e) = start_librespot_daemon(t, cmd_rx).await {
-                let _ = std::fs::write(&config::paths().log_file, format!("Librespot error: {}\n", e));
+                let _ = std::fs::write(
+                    &config::paths().log_file,
+                    format!("Librespot error: {}\n", e),
+                );
             }
         });
     }
@@ -476,9 +603,12 @@ pub async fn main() -> Result<()> {
     });
 
     let show_others = false;
-    let filtered_playlists: Vec<Playlist> = app_cache.playlists.iter().filter(|p| {
-        show_others || p.owner_id == user_id || p.collaborative
-    }).cloned().collect();
+    let filtered_playlists: Vec<Playlist> = app_cache
+        .playlists
+        .iter()
+        .filter(|p| show_others || p.owner_id == user_id || p.collaborative)
+        .cloned()
+        .collect();
 
     let mut playlist_state = ListState::default();
     if !filtered_playlists.is_empty() {
@@ -542,6 +672,6 @@ pub async fn main() -> Result<()> {
     if let Err(err) = res {
         println!("{:?}", err);
     }
-    
+
     Ok(())
 }
