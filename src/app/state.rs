@@ -108,6 +108,43 @@ pub struct AppState {
     pub last_action_timestamp: u64,
 }
 
+impl AppState {
+    pub fn merge_incoming_player_state(&mut self, mut pstate: Option<PlayerState>, now: u64) {
+        let is_debounce_active = now.saturating_sub(self.last_action_timestamp) < 3;
+
+        if is_debounce_active {
+            if let Some(ref local_ps) = self.player_state {
+                if let Some(ref incoming_ps) = pstate {
+                    if incoming_ps.track_name != local_ps.track_name {
+                        return; // Drop lagging packet
+                    }
+                }
+            }
+        }
+
+        if is_debounce_active {
+            if let Some(ref local_ps) = self.player_state {
+                if let Some(ref mut incoming_ps) = pstate {
+                    incoming_ps.is_playing = local_ps.is_playing;
+                    incoming_ps.volume_percent = local_ps.volume_percent;
+                    incoming_ps.progress_ms = local_ps.progress_ms;
+                    incoming_ps.is_buffering = local_ps.is_buffering;
+                }
+            }
+        }
+
+        if let Some(ref local_ps) = self.player_state {
+            if let Some(ref mut incoming_ps) = pstate {
+                if incoming_ps.track_name == local_ps.track_name {
+                    incoming_ps.lyrics = local_ps.lyrics.clone();
+                }
+            }
+        }
+
+        self.player_state = pstate;
+    }
+}
+
 // Async Message passing
 pub enum AppMessage {
     TracksFetched {

@@ -1,6 +1,12 @@
 use directories::ProjectDirs;
 use std::path::PathBuf;
 
+pub const AUTH_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_PORT: u16 = 8480;
+pub const SEEK_SHORT_MS: u64 = 5000;
+pub const SEEK_LONG_MS: u64 = 15000;
+pub const VOLUME_STEP: u8 = 5;
+
 pub struct AppPaths {
     pub cache_file: PathBuf,
     pub token_cache_file: PathBuf,
@@ -10,16 +16,28 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn init() -> Self {
-        let proj_dirs = ProjectDirs::from("com", "spotme", "spotme")
-            .expect("Failed to bind robust OS-native directory structures!");
+        let proj_dirs = ProjectDirs::from("com", "spotme", "spotme");
 
-        let cache_dir = proj_dirs.cache_dir();
-        let data_dir = proj_dirs.data_dir();
-        let config_dir = proj_dirs.config_dir();
+        let (cache_dir, data_dir, config_dir) = if let Some(p) = proj_dirs {
+            (
+                p.cache_dir().to_path_buf(),
+                p.data_dir().to_path_buf(),
+                p.config_dir().to_path_buf(),
+            )
+        } else {
+            let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            (base.clone(), base.clone(), base.clone())
+        };
 
-        std::fs::create_dir_all(cache_dir).unwrap_or_default();
-        std::fs::create_dir_all(data_dir).unwrap_or_default();
-        std::fs::create_dir_all(config_dir).unwrap_or_default();
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            eprintln!("Warning: Failed to create cache directory: {}", e);
+        }
+        if let Err(e) = std::fs::create_dir_all(&data_dir) {
+            eprintln!("Warning: Failed to create data directory: {}", e);
+        }
+        if let Err(e) = std::fs::create_dir_all(&config_dir) {
+            eprintln!("Warning: Failed to create config directory: {}", e);
+        }
 
         Self {
             cache_file: cache_dir.join("spotme_cache.json"),

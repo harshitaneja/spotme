@@ -98,7 +98,9 @@ pub fn handle_key_events(
                 // Seek back 5s
                 if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let seek_ms = player.progress_ms.saturating_sub(5000);
+                    let seek_ms = player
+                        .progress_ms
+                        .saturating_sub(crate::config::SEEK_SHORT_MS);
                     app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
@@ -109,7 +111,10 @@ pub fn handle_key_events(
                 // Seek forward 5s
                 if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let seek_ms = std::cmp::min(player.progress_ms + 5000, player.duration_ms);
+                    let seek_ms = std::cmp::min(
+                        player.progress_ms + crate::config::SEEK_SHORT_MS,
+                        player.duration_ms,
+                    );
                     app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
@@ -120,7 +125,9 @@ pub fn handle_key_events(
                 // Seek back 15s
                 if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let seek_ms = player.progress_ms.saturating_sub(15000);
+                    let seek_ms = player
+                        .progress_ms
+                        .saturating_sub(crate::config::SEEK_LONG_MS);
                     app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
@@ -135,7 +142,10 @@ pub fn handle_key_events(
                     };
                 } else if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let seek_ms = std::cmp::min(player.progress_ms + 15000, player.duration_ms);
+                    let seek_ms = std::cmp::min(
+                        player.progress_ms + crate::config::SEEK_LONG_MS,
+                        player.duration_ms,
+                    );
                     app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
@@ -175,7 +185,8 @@ pub fn handle_key_events(
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let vol = std::cmp::min(player.volume_percent + 5, 100);
+                    let vol =
+                        std::cmp::min(player.volume_percent + crate::config::VOLUME_STEP, 100);
                     app_state.player_state.as_mut().unwrap().volume_percent = vol;
                     tokio::spawn(async move {
                         let _ = set_volume(&token, vol).await;
@@ -185,7 +196,9 @@ pub fn handle_key_events(
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 if let Some(player) = &app_state.player_state {
                     let token = app_state.access_token.clone();
-                    let vol = player.volume_percent.saturating_sub(5);
+                    let vol = player
+                        .volume_percent
+                        .saturating_sub(crate::config::VOLUME_STEP);
                     app_state.player_state.as_mut().unwrap().volume_percent = vol;
                     tokio::spawn(async move {
                         let _ = set_volume(&token, vol).await;

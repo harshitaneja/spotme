@@ -48,7 +48,7 @@ fn save_cache(cache: &AppCache) {
 pub fn get_current_unix_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or(std::time::Duration::default())
         .as_secs()
 }
 
@@ -248,39 +248,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         continue;
                     }
 
-                    let is_debounce_active =
-                        now.saturating_sub(app_state.last_action_timestamp) < 3;
-
-                    if is_debounce_active {
-                        if let Some(ref local_ps) = app_state.player_state {
-                            if let Some(ref incoming_ps) = pstate {
-                                if incoming_ps.track_name != local_ps.track_name {
-                                    continue; // Drop the lagging packet completely to prevent track name flashing!
-                                }
-                            }
-                        }
-                    }
-
-                    if is_debounce_active {
-                        if let Some(ref local_ps) = app_state.player_state {
-                            if let Some(ref mut incoming_ps) = pstate {
-                                incoming_ps.is_playing = local_ps.is_playing;
-                                incoming_ps.volume_percent = local_ps.volume_percent;
-                                incoming_ps.progress_ms = local_ps.progress_ms;
-                                incoming_ps.is_buffering = local_ps.is_buffering;
-                            }
-                        }
-                    }
-
-                    if let Some(ref local_ps) = app_state.player_state {
-                        if let Some(ref mut incoming_ps) = pstate {
-                            if incoming_ps.track_name == local_ps.track_name {
-                                incoming_ps.lyrics = local_ps.lyrics.clone();
-                            }
-                        }
-                    }
-
-                    app_state.player_state = pstate;
+                    app_state.merge_incoming_player_state(pstate, now);
 
                     if let Some(ref mut ps) = app_state.player_state {
                         let mut cache_dirty = false;
@@ -559,12 +527,13 @@ pub async fn main() -> Result<()> {
     dotenv().ok();
     dotenvy::from_path(&crate::config::paths().env_file).ok();
 
-    // Auth Flow
-    let client_id = env::var("SPOTIFY_CLIENT_ID").unwrap_or_else(|_| "db41158aa95448d6914e73975652b52a".to_string());
-    let client_secret = env::var("SPOTIFY_CLIENT_SECRET").unwrap_or_else(|_| "5df5c5e058d1467cbe8fcd4625180476".to_string());
-    let redirect_uri = env::var("SPOTIFY_REDIRECT_URI").unwrap_or_else(|_| "http://127.0.0.1:8480/callback".to_string());
+    // Auth Flow utilizing PKCE (No secret needed)
+    let client_id = env::var("SPOTIFY_CLIENT_ID")
+        .unwrap_or_else(|_| "db41158aa95448d6914e73975652b52a".to_string());
+    let redirect_uri = env::var("SPOTIFY_REDIRECT_URI")
+        .unwrap_or_else(|_| "http://127.0.0.1:8480/callback".to_string());
 
-    let access_token = get_or_refresh_token(&client_id, &client_secret, &redirect_uri).await?;
+    let access_token = get_or_refresh_token(&client_id, &redirect_uri).await?;
     let (display_name, raw_user_id) = fetch_user_profile(&access_token).await?;
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<LocalPlayerCommand>(10);

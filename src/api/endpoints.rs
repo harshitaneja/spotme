@@ -14,14 +14,10 @@ use librespot_playback::player::Player;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
-pub async fn get_or_refresh_token(
-    client_id: &str,
-    client_secret: &str,
-    redirect_uri: &str,
-) -> Result<String> {
+pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result<String> {
     let cache_path = &config::paths().token_cache_file;
 
-    if let Ok(content) = std::fs::read_to_string(cache_path) {
+    if let Ok(content) = tokio::fs::read_to_string(cache_path).await {
         if let Ok(cache) = serde_json::from_str::<SpotifyTokenCache>(&content) {
             if get_current_unix_time() < cache.expires_at {
                 return Ok(cache.access_token);
@@ -30,10 +26,10 @@ pub async fn get_or_refresh_token(
             let client = crate::api::get_client();
             let res = client
                 .post("https://accounts.spotify.com/api/token")
-                .basic_auth(client_id, Some(client_secret))
                 .form(&[
                     ("grant_type", "refresh_token"),
                     ("refresh_token", &cache.refresh_token),
+                    ("client_id", client_id),
                 ])
                 .send()
                 .await;
@@ -53,7 +49,20 @@ pub async fn get_or_refresh_token(
                         };
 
                         if let Ok(cache_str) = serde_json::to_string(&new_cache) {
-                            let _ = std::fs::write(cache_path, cache_str);
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = tokio::fs::write(cache_path, &cache_str).await;
+                                if let Ok(meta) = std::fs::metadata(cache_path) {
+                                    let mut perms = meta.permissions();
+                                    perms.set_mode(0o600);
+                                    let _ = std::fs::set_permissions(cache_path, perms);
+                                }
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                let _ = tokio::fs::write(cache_path, &cache_str).await;
+                            }
                         }
                         return Ok(access.to_string());
                     }
@@ -62,13 +71,29 @@ pub async fn get_or_refresh_token(
         }
     }
 
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use rand::RngExt;
+    use sha2::{Digest, Sha256};
+
+    // Generate Code Verifier
+    let mut rng = rand::rng();
+    let mut verifier_bytes = [0u8; 32];
+    rng.fill(&mut verifier_bytes);
+    let code_verifier = URL_SAFE_NO_PAD.encode(&verifier_bytes);
+
+    // Generate Code Challenge
+    let mut hasher = Sha256::new();
+    hasher.update(code_verifier.as_bytes());
+    let code_challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+
     let scopes = "user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-modify-playback-state user-read-playback-state streaming";
-    let enc_redirect = redirect_uri.replace(":", "%3A").replace("/", "%2F");
-    let enc_scopes = scopes.replace(" ", "%20");
+    let enc_redirect = urlencoding::encode(redirect_uri);
+    let enc_scopes = urlencoding::encode(scopes);
 
     let auth_url = format!(
-        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&show_dialog=true",
-        client_id, enc_redirect, enc_scopes
+        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&show_dialog=true",
+        client_id, enc_redirect, enc_scopes, code_challenge
     );
 
     println!("Opening Spotify login in your browser...");
@@ -86,15 +111,18 @@ pub async fn get_or_refresh_token(
         .split('/')
         .next()
         .unwrap_or("8480");
-    let port_u16 = port_part.parse::<u16>().unwrap_or(8480);
+    let port_u16 = port_part
+        .parse::<u16>()
+        .unwrap_or(crate::config::DEFAULT_PORT);
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_u16)).await?;
-
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_u16))
+        .await
+        .unwrap_or_else(|_| panic!("Failed to bind port {}", port_u16));
     println!("Waiting up to 120 seconds for browser authentication... (Press Ctrl+C to cancel)");
 
     let code = tokio::select! {
-        _ = tokio::time::sleep(tokio::time::Duration::from_secs(120)) => {
-            return Err(anyhow::anyhow!("Authentication timed out after 120 seconds. Please run SpotMe again."));
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(crate::config::AUTH_TIMEOUT_SECS)) => {
+            return Err(anyhow::anyhow!("Authentication timed out after {} seconds. Please run SpotMe again.", crate::config::AUTH_TIMEOUT_SECS));
         }
         accept_res = listener.accept() => {
             match accept_res {
@@ -117,14 +145,10 @@ pub async fn get_or_refresh_token(
                     let response_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1 style=\"font-family: sans-serif\">SpotMe Login Successful!</h1><p style=\"font-family: sans-serif\">You can safely close this tab and return to the terminal.</p><script>window.close();</script></body></html>";
                     let _ = socket.write_all(response_html.as_bytes()).await;
 
-                    if auth_code.is_empty() {
-                        return Err(anyhow::anyhow!("Could not extract code from callback request!"));
-                    }
+                    if auth_code.is_empty() { return Err(anyhow::anyhow!("Could not extract code from callback request!")); }
                     auth_code
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Listener failed to accept connection: {}", e));
-                }
+                Err(e) => { return Err(anyhow::anyhow!("Listener failed to accept connection: {}", e)); }
             }
         }
     };
@@ -132,16 +156,17 @@ pub async fn get_or_refresh_token(
     let client = crate::api::get_client();
     let response = client
         .post("https://accounts.spotify.com/api/token")
-        .basic_auth(client_id, Some(client_secret))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
             ("redirect_uri", redirect_uri),
+            ("client_id", client_id),
+            ("code_verifier", &code_verifier),
         ])
         .send()
         .await?;
 
-    let json = response.json::<serde_json::Value>().await?;
+    let json: serde_json::Value = response.json().await?;
     if let Some(access) = json["access_token"].as_str() {
         let refresh = json["refresh_token"].as_str().unwrap_or("");
         let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
@@ -153,12 +178,28 @@ pub async fn get_or_refresh_token(
         };
 
         if let Ok(cache_str) = serde_json::to_string(&new_cache) {
-            let _ = std::fs::write(cache_path, cache_str);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = tokio::fs::write(cache_path, &cache_str).await;
+                if let Ok(meta) = std::fs::metadata(cache_path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(cache_path, perms);
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::fs::write(cache_path, &cache_str).await;
+            }
         }
         return Ok(access.to_string());
     }
 
-    Err(anyhow::anyhow!("Failed to parse token response: {}", json))
+    Err(anyhow::anyhow!(
+        "Failed to parse token response: {:?}",
+        json
+    ))
 }
 
 pub async fn fetch_user_profile(token: &str) -> Result<(String, String)> {
@@ -276,16 +317,18 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
 
     match req_res {
         Ok(r) => {
-            let _ = std::fs::write(
+            let _ = tokio::fs::write(
                 &config::paths().log_file,
                 format!("Play request sent. Status: {}, URL: {}\n", r.status(), url),
-            );
+            )
+            .await;
         }
         Err(e) => {
-            let _ = std::fs::write(
+            let _ = tokio::fs::write(
                 &config::paths().log_file,
                 format!("Play request FAILED: {}\n", e),
-            );
+            )
+            .await;
         }
     }
     Ok(())
@@ -403,45 +446,9 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
                 if track_obj.is_null() {
                     track_obj = &item["item"];
                 }
-                if track_obj.is_null() || !track_obj.is_object() {
-                    continue;
+                if let Some(t) = Track::parse_track(track_obj, None, None) {
+                    tracks.push(t);
                 }
-
-                let name = track_obj["name"]
-                    .as_str()
-                    .unwrap_or("Unknown Track")
-                    .to_string();
-                let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
-
-                let mut artists = Vec::new();
-                if let Some(artists_arr) = track_obj["artists"].as_array() {
-                    for artist in artists_arr {
-                        if let Some(a_name) = artist["name"].as_str() {
-                            artists.push(a_name.to_string());
-                        }
-                    }
-                }
-                let artist_str = if artists.is_empty() {
-                    "Unknown Artist".to_string()
-                } else {
-                    artists.join(", ")
-                };
-
-                let album = track_obj["album"]["name"]
-                    .as_str()
-                    .unwrap_or("Unknown Album")
-                    .to_string();
-                let album_id = track_obj["album"]["id"].as_str().map(|s| s.to_string());
-                let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
-
-                tracks.push(Track {
-                    name,
-                    artist: artist_str,
-                    album,
-                    album_id,
-                    duration_ms,
-                    uri,
-                });
             }
         } else {
             if tracks.is_empty() {
@@ -471,23 +478,9 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
     Ok(tracks)
 }
 
-fn url_encode(input: &str) -> String {
-    let mut encoded = String::new();
-    for b in input.as_bytes() {
-        match *b {
-            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*b as char)
-            }
-            b' ' => encoded.push_str("%20"),
-            _ => encoded.push_str(&format!("%{:02X}", b)),
-        }
-    }
-    encoded
-}
-
 pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, String> {
     let client = crate::api::get_client();
-    let safe_query = url_encode(query.trim());
+    let safe_query = urlencoding::encode(query.trim());
 
     // Spotify natively defaults to 20 limit. Leaving it omitted bypasses the 400 Bad Request parameter fault.
     let url = format!(
@@ -533,29 +526,9 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
     let mut tracks = Vec::new();
     if let Some(items) = json["tracks"]["items"].as_array() {
         for item in items {
-            let name = item["name"].as_str().unwrap_or("").to_string();
-            let uri = item["uri"].as_str().unwrap_or("").to_string();
-            let duration_ms = item["duration_ms"].as_u64().unwrap_or(0);
-
-            let mut artist_names: Vec<String> = Vec::new();
-            if let Some(artists) = item["artists"].as_array() {
-                for a in artists {
-                    if let Some(n) = a["name"].as_str() {
-                        artist_names.push(n.to_string());
-                    }
-                }
+            if let Some(t) = Track::parse_track(item, None, None) {
+                tracks.push(t);
             }
-
-            let album = item["album"]["name"].as_str().unwrap_or("").to_string();
-            let album_id = item["album"]["id"].as_str().map(|s| s.to_string());
-            tracks.push(Track {
-                name,
-                artist: artist_names.join(", "),
-                album,
-                album_id,
-                duration_ms,
-                uri,
-            });
         }
     } else {
         return Err(format!("Bad payload: no items array. {}", json));
@@ -625,37 +598,9 @@ pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
 
     if let Some(queue) = json["queue"].as_array() {
         for track_obj in queue {
-            let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
-            let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
-            let album = track_obj["album"]["name"]
-                .as_str()
-                .unwrap_or("Unknown Album")
-                .to_string();
-            let album_id = track_obj["album"]["id"].as_str().map(|s| s.to_string());
-            let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
-
-            let mut artists = Vec::new();
-            if let Some(artists_arr) = track_obj["artists"].as_array() {
-                for artist in artists_arr {
-                    if let Some(a_name) = artist["name"].as_str() {
-                        artists.push(a_name.to_string());
-                    }
-                }
+            if let Some(t) = Track::parse_track(track_obj, None, None) {
+                tracks.push(t);
             }
-            let artist_str = if artists.is_empty() {
-                "Unknown Artist".to_string()
-            } else {
-                artists.join(", ")
-            };
-
-            tracks.push(Track {
-                name,
-                artist: artist_str,
-                album,
-                album_id,
-                duration_ms,
-                uri,
-            });
         }
     } else {
         return Err(format!("Bad payload: no queue array. {}", json));
@@ -683,32 +628,11 @@ pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track
 
     if let Some(items) = json["tracks"]["items"].as_array() {
         for track_obj in items {
-            let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
-            let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
-            let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
-
-            let mut artists = Vec::new();
-            if let Some(artists_arr) = track_obj["artists"].as_array() {
-                for artist in artists_arr {
-                    if let Some(a_name) = artist["name"].as_str() {
-                        artists.push(a_name.to_string());
-                    }
-                }
+            if let Some(t) =
+                Track::parse_track(track_obj, Some(&album_name), album_id_opt.as_deref())
+            {
+                tracks.push(t);
             }
-            let artist_str = if artists.is_empty() {
-                "Unknown Artist".to_string()
-            } else {
-                artists.join(", ")
-            };
-
-            tracks.push(Track {
-                name,
-                artist: artist_str,
-                album: album_name.clone(),
-                album_id: album_id_opt.clone(),
-                duration_ms,
-                uri,
-            });
         }
     }
     Ok(tracks)
