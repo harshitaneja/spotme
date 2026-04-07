@@ -34,6 +34,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+struct GradientBackground {
+    dominant: (u8, u8, u8),
+}
+
+impl ratatui::widgets::Widget for GradientBackground {
+    fn render(self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
+        for y in area.top()..area.bottom() {
+            let factor = 1.0 - ((y - area.top()) as f32 / area.height as f32);
+            let r = (self.dominant.0 as f32 * factor) as u8;
+            let g = (self.dominant.1 as f32 * factor) as u8;
+            let b = (self.dominant.2 as f32 * factor) as u8;
+            
+            for x in area.left()..area.right() {
+                buf.get_mut(x, y).set_bg(ratatui::style::Color::Rgb(r, g, b));
+            }
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct SpotifyTokenCache {
     access_token: String,
@@ -55,6 +74,7 @@ struct Track {
     name: String,
     artist: String,
     album: String,
+    album_id: Option<String>,
     duration_ms: u64,
     uri: String,
 }
@@ -142,6 +162,9 @@ struct AppState {
     fullscreen_player: bool,
     lyrics_mode: LyricsMode,
     lyrics_scroll_offset: usize,
+    dominant_color: Option<(u8, u8, u8)>,
+    show_help: bool,
+    show_popup: bool,
     local_cmd_tx: Option<mpsc::Sender<LocalPlayerCommand>>,
     last_action_timestamp: u64,
 }
@@ -157,6 +180,9 @@ enum AppMessage {
     SearchError(String),
     TrackAddedToPlaylist(String),
     LyricsLoaded(Result<Lyrics, String>),
+    QueueFetched(Result<Vec<Track>, String>),
+    FeaturedFetched(Vec<Playlist>),
+    AlbumTracksFetched { album_name: String, tracks: Result<Vec<Track>, String> },
 }
 
 fn format_duration(ms: u64) -> String {
@@ -477,6 +503,9 @@ async fn main() -> Result<()> {
         fullscreen_player: false,
         lyrics_mode: LyricsMode::Focused,
         lyrics_scroll_offset: 0,
+        dominant_color: None,
+        show_help: false,
+        show_popup: false,
         local_cmd_tx: Some(cmd_tx),
         last_action_timestamp: 0,
     };
@@ -578,6 +607,22 @@ async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Erro
     Ok(())
 }
 
+async fn next_track(token: &str) -> Result<(), anyhow::Error> {
+    let client = reqwest::Client::new();
+    client.post("https://api.spotify.com/v1/me/player/next")
+        .bearer_auth(token)
+        .send().await?;
+    Ok(())
+}
+
+async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
+    let client = reqwest::Client::new();
+    client.post("https://api.spotify.com/v1/me/player/previous")
+        .bearer_auth(token)
+        .send().await?;
+    Ok(())
+}
+
 // Track Fetch Hook
 async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
     let client = reqwest::Client::new();
@@ -647,9 +692,10 @@ async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, 
                 let artist_str = if artists.is_empty() { "Unknown Artist".to_string() } else { artists.join(", ") };
                 
                 let album = track_obj["album"]["name"].as_str().unwrap_or("Unknown Album").to_string();
+                let album_id = track_obj["album"]["id"].as_str().map(|s| s.to_string());
                 let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
                 
-                tracks.push(Track { name, artist: artist_str, album, duration_ms, uri });
+                tracks.push(Track { name, artist: artist_str, album, album_id, duration_ms, uri });
             }
         } else {
             if tracks.is_empty() {
@@ -736,7 +782,8 @@ async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, Stri
             }
             
             let album = item["album"]["name"].as_str().unwrap_or("").to_string();
-            tracks.push(Track { name, artist: artist_names.join(", "), album, duration_ms, uri });
+            let album_id = item["album"]["id"].as_str().map(|s| s.to_string());
+            tracks.push(Track { name, artist: artist_names.join(", "), album, album_id, duration_ms, uri });
         }
     } else {
         return Err(format!("Bad payload: no items array. {}", json));
@@ -770,6 +817,104 @@ async fn add_track_to_playlist_api(token: &str, playlist_id: &str, track_uri: &s
         app_log(&format!("ADD TRACK FAULT {}: {}", status, text));
         anyhow::bail!("Failed to add track")
     }
+}
+
+async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
+    let client = reqwest::Client::new();
+    let url = "https://api.spotify.com/v1/me/player/queue";
+    app_log(&format!("NETWORK INIT: GET {}", url));
+    let res = client.get(url).bearer_auth(token).send().await.map_err(|e| format!("Req Err: {}", e))?;
+    let status = res.status();
+    if !status.is_success() {
+        return Err(format!("Bad Status {}: {}", status, res.text().await.unwrap_or_default()));
+    }
+    let text_payload = res.text().await.map_err(|e| format!("Text read Err: {}", e))?;
+    let json: serde_json::Value = serde_json::from_str(&text_payload).map_err(|e| format!("JSON Err: {}", e))?;
+    
+    let mut tracks = Vec::new();
+    
+    if let Some(queue) = json["queue"].as_array() {
+        for track_obj in queue {
+            let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
+            let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
+            let album = track_obj["album"]["name"].as_str().unwrap_or("Unknown Album").to_string();
+            let album_id = track_obj["album"]["id"].as_str().map(|s| s.to_string());
+            let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
+            
+            let mut artists = Vec::new();
+            if let Some(artists_arr) = track_obj["artists"].as_array() {
+                for artist in artists_arr {
+                    if let Some(a_name) = artist["name"].as_str() {
+                        artists.push(a_name.to_string());
+                    }
+                }
+            }
+            let artist_str = if artists.is_empty() { "Unknown Artist".to_string() } else { artists.join(", ") };
+            
+            tracks.push(Track { name, artist: artist_str, album, album_id, duration_ms, uri });
+        }
+    } else {
+        return Err(format!("Bad payload: no queue array. {}", json));
+    }
+    Ok(tracks)
+}
+
+async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track>, String> {
+    let client = reqwest::Client::new();
+    let url = format!("https://api.spotify.com/v1/albums/{}", album_id);
+    let res = client.get(&url).bearer_auth(token).send().await.map_err(|e| format!("Req Err: {}", e))?;
+    if !res.status().is_success() {
+        return Err(format!("Bad Status {}", res.status()));
+    }
+    let json: serde_json::Value = res.json().await.map_err(|e| format!("JSON Err: {}", e))?;
+    
+    let mut tracks = Vec::new();
+    let album_name = json["name"].as_str().unwrap_or("").to_string();
+    let album_id_opt = Some(album_id.to_string());
+    
+    if let Some(items) = json["tracks"]["items"].as_array() {
+        for track_obj in items {
+            let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
+            let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
+            let duration_ms = track_obj["duration_ms"].as_u64().unwrap_or(0);
+            
+            let mut artists = Vec::new();
+            if let Some(artists_arr) = track_obj["artists"].as_array() {
+                for artist in artists_arr {
+                    if let Some(a_name) = artist["name"].as_str() {
+                        artists.push(a_name.to_string());
+                    }
+                }
+            }
+            let artist_str = if artists.is_empty() { "Unknown Artist".to_string() } else { artists.join(", ") };
+            
+            tracks.push(Track { name, artist: artist_str, album: album_name.clone(), album_id: album_id_opt.clone(), duration_ms, uri });
+        }
+    }
+    Ok(tracks)
+}
+
+async fn fetch_featured_playlists_api(token: &str) -> Vec<Playlist> {
+    let client = reqwest::Client::new();
+    let url = "https://api.spotify.com/v1/browse/featured-playlists?limit=50";
+    if let Ok(res) = client.get(url).bearer_auth(token).send().await {
+        if res.status().is_success() {
+            if let Ok(json) = res.json::<serde_json::Value>().await {
+                let mut lists = Vec::new();
+                if let Some(items) = json["playlists"]["items"].as_array() {
+                    for item in items {
+                        if item.is_null() { continue; }
+                        let id = item["id"].as_str().unwrap_or("").to_string();
+                        let name = item["name"].as_str().unwrap_or("Featured Playlist").to_string();
+                        let owner_id = item["owner"]["id"].as_str().unwrap_or("spotify").to_string();
+                        lists.push(Playlist { id, name, owner_id, collaborative: false });
+                    }
+                }
+                return lists;
+            }
+        }
+    }
+    Vec::new()
 }
 
 async fn fetch_lyrics_api(track_name: &str, artist_name: &str) -> Result<Lyrics, anyhow::Error> {
@@ -973,6 +1118,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             name: err,
                             artist: String::new(),
                             album: String::new(),
+                            album_id: None,
                             duration_ms: 0,
                             uri: "".to_string(),
                         }],
@@ -1089,8 +1235,16 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     app_state.current_art_url = Some(url);
                     app_state.current_art_bytes = Some(bytes.clone());
                     if let Ok(dyn_img) = image::load_from_memory(&bytes) {
-                        let protocol = app_state.picker.new_resize_protocol(dyn_img);
+                        let protocol = app_state.picker.new_resize_protocol(dyn_img.clone());
                         app_state.current_art_protocol = Some(protocol);
+                        
+                        let thumbnail = dyn_img.resize_exact(1, 1, image::imageops::FilterType::Nearest);
+                        let rgb = thumbnail.to_rgb8();
+                        if let Some(pixel) = rgb.pixels().next() {
+                            let p = pixel.0;
+                            let dampen = 0.5; // Dampen brightness so text remains extremely legible
+                            app_state.dominant_color = Some(((p[0] as f32 * dampen) as u8, (p[1] as f32 * dampen) as u8, (p[2] as f32 * dampen) as u8));
+                        }
                     }
                 }
                 AppMessage::SearchResults(tracks) => {
@@ -1113,7 +1267,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
             }
             AppMessage::SearchError(err) => {
                 if let View::SearchGlobal { query: ref mut _query, tracks: ref mut tracks, state: ref mut _s, ref mut is_typing } = app_state.current_view {
-                    *tracks = Some(vec![Track { name: format!("Error: {}", err), artist: String::new(), album: String::new(), duration_ms: 0, uri: "".to_string() }]);
+                    *tracks = Some(vec![Track { name: format!("Error: {}", err), artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }]);
                     *is_typing = false;
                 }
             }
@@ -1130,6 +1284,60 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 if let Some(p) = prev {
                     app_state.current_view = *p;
                 }
+            }
+            AppMessage::QueueFetched(Ok(tracks)) => {
+                let mut list_state = ListState::default();
+                if !tracks.is_empty() { list_state.select(Some(0)); }
+                app_state.current_view = View::Tracks {
+                    playlist_id: "queue".to_string(),
+                    playlist_name: "Player Queue".to_string(),
+                    tracks,
+                    state: list_state,
+                    search_query: String::new(),
+                    is_searching: false,
+                };
+            }
+            AppMessage::QueueFetched(Err(err)) => {
+                let mut list_state = ListState::default();
+                list_state.select(Some(0));
+                app_state.current_view = View::Tracks {
+                    playlist_id: "queue_err".to_string(),
+                    playlist_name: "Queue Error".to_string(),
+                    tracks: vec![Track { name: err, artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }],
+                    state: list_state,
+                    search_query: String::new(),
+                    is_searching: false,
+                };
+            }
+            AppMessage::FeaturedFetched(lists) => {
+                app_state.app_cache.playlists.extend(lists.clone());
+                app_state.filtered_playlists = lists;
+                app_state.playlist_state.select(if app_state.filtered_playlists.is_empty() { None } else { Some(0) });
+                app_state.current_view = View::Playlists;
+            }
+            AppMessage::AlbumTracksFetched { album_name, tracks: Ok(tracks) } => {
+                let mut list_state = ListState::default();
+                if !tracks.is_empty() { list_state.select(Some(0)); }
+                app_state.current_view = View::Tracks {
+                    playlist_id: format!("album_{}", album_name),
+                    playlist_name: album_name,
+                    tracks,
+                    state: list_state,
+                    search_query: String::new(),
+                    is_searching: false,
+                };
+            }
+            AppMessage::AlbumTracksFetched { album_name, tracks: Err(err) } => {
+                let mut list_state = ListState::default();
+                list_state.select(Some(0));
+                app_state.current_view = View::Tracks {
+                    playlist_id: format!("album_err_{}", album_name),
+                    playlist_name: format!("Error: {}", album_name),
+                    tracks: vec![Track { name: err, artist: String::new(), album: String::new(), album_id: None, duration_ms: 0, uri: "".to_string() }],
+                    state: list_state,
+                    search_query: String::new(),
+                    is_searching: false,
+                };
             }
             AppMessage::LyricsLoaded(result) => {
                 let parsed = result.ok();
@@ -1158,9 +1366,19 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         // GUI IO Polling logic
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                if app_state.show_help {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q')) {
+                        app_state.show_help = false;
+                    }
+                    continue; // Lock view events
+                }
+                
                 let mut is_typing = false;
                 if let View::Tracks { is_searching, .. } = &app_state.current_view {
                     is_typing = *is_searching;
+                }
+                if let View::SearchGlobal { is_typing: st, .. } = &app_state.current_view {
+                    is_typing = *st;
                 }
                 if !is_typing {
                     if app_state.fullscreen_player && app_state.lyrics_mode == LyricsMode::Full {
@@ -1266,6 +1484,17 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             }
                         }
                     }
+                    KeyCode::Char('?') => {
+                        app_state.show_help = true;
+                    }
+                    KeyCode::Char('n') => {
+                        let token = app_state.access_token.clone();
+                        tokio::spawn(async move { let _ = next_track(&token).await; });
+                    }
+                    KeyCode::Char('p') => {
+                        let token = app_state.access_token.clone();
+                        tokio::spawn(async move { let _ = previous_track(&token).await; });
+                    }
                     KeyCode::Char('+') | KeyCode::Char('=') => {
                         if let Some(player) = &app_state.player_state {
                             let token = app_state.access_token.clone();
@@ -1282,8 +1511,23 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             tokio::spawn(async move { let _ = set_volume(&token, vol).await; });
                         }
                     }
-                    KeyCode::Char('v') => {
+                    KeyCode::Char('v') | KeyCode::Char('f') => {
                         app_state.fullscreen_player = !app_state.fullscreen_player;
+                    }
+                    KeyCode::Tab => {
+                        app_state.show_popup = !app_state.show_popup;
+                    }
+                    KeyCode::Char('w') | KeyCode::Char('e') => {
+                        let token = app_state.access_token.clone();
+                        let tx = tx.clone();
+                        app_state.show_popup = true;
+                        app_state.current_view = View::LoadingTracks { spinner_tick: 0 };
+                        tokio::spawn(async move {
+                            match fetch_player_queue(&token).await {
+                                Ok(tracks) => { let _ = tx.send(AppMessage::QueueFetched(Ok(tracks))); }
+                                Err(e) => { let _ = tx.send(AppMessage::QueueFetched(Err(e))); }
+                            }
+                        });
                     }
                     _ => {}
                 }
@@ -1311,6 +1555,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                 app_state.playlist_state.select(Some(i));
                             }
                             KeyCode::Char('s') => {
+                                app_state.show_popup = true;
                                 app_state.current_view = View::SearchGlobal { query: String::new(), tracks: None, state: ListState::default(), is_typing: true };
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
@@ -1326,6 +1571,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     app_state.show_others || p.owner_id == app_state.user_id || p.collaborative
                                 }).cloned().collect();
                                 app_state.playlist_state.select(if app_state.filtered_playlists.is_empty() { None } else { Some(0) });
+                            }
+                            KeyCode::Char('b') => {
+                                let token = app_state.access_token.clone();
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let lists = fetch_featured_playlists_api(&token).await;
+                                    let _ = tx.send(AppMessage::FeaturedFetched(lists));
+                                });
                             }
                             KeyCode::Char('r') => {
                                 let tx = tx.clone();
@@ -1390,6 +1643,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         } else {
                             match key.code {
                                 KeyCode::Char('/') => {
+                                    app_state.show_popup = true;
                                     *is_searching = true;
                                     search_query.clear();
                                 }
@@ -1413,6 +1667,25 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     });
                                 }
                                 KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('A') => {
+                                    if let Some(i) = state.selected() {
+                                        if i < tracks.len() {
+                                            if let Some(ref aid) = tracks[i].album_id {
+                                                let token = app_state.access_token.clone();
+                                                let tx = tx.clone();
+                                                let a_name = tracks[i].album.clone();
+                                                let a_id = aid.clone();
+                                                app_state.current_view = View::LoadingTracks { spinner_tick: 0 };
+                                                tokio::spawn(async move {
+                                                    match fetch_album_tracks(&token, &a_id).await {
+                                                        Ok(tracks) => { let _ = tx.send(AppMessage::AlbumTracksFetched { album_name: a_name, tracks: Ok(tracks) }); }
+                                                        Err(e) => { let _ = tx.send(AppMessage::AlbumTracksFetched { album_name: a_name, tracks: Err(e) }); }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
                                 KeyCode::Char('a') => {
                                     if let Some(i) = state.selected() {
                                         if i < tracks.len() {
@@ -1456,6 +1729,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                 KeyCode::Enter => {
                                     if let Some(i) = state.selected() {
                                         if i < tracks.len() {
+                                            app_state.show_popup = false;
                                             let token = app_state.access_token.clone();
                                             let track = tracks[i].clone();
                                             let uri = track.uri.clone();
@@ -1561,6 +1835,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     if let Some(t) = tracks {
                                         if let Some(i) = state.selected() {
                                             if i < t.len() {
+                                                app_state.show_popup = false;
                                                 let token = app_state.access_token.clone();
                                                 let track = t[i].clone();
                                                 let uri = track.uri.clone();
@@ -1667,6 +1942,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 }
 
 fn ui(f: &mut Frame, state: &mut AppState) {
+    if state.fullscreen_player {
+        if let Some((r, g, b)) = state.dominant_color {
+            f.render_widget(GradientBackground { dominant: (r, g, b) }, f.area());
+        }
+    }
+
     let is_vim_cmd = match state.current_view {
         View::Tracks { is_searching, ref search_query, .. } => is_searching || !search_query.is_empty(),
         View::SearchGlobal { is_typing, ref query, .. } => is_typing || !query.is_empty(),
@@ -1691,138 +1972,166 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         .constraints(constraints)
         .split(f.area());
 
+    let mut render_view = !state.fullscreen_player;
+    let mut actual_view_chunk = chunks[1];
+    let mut actual_cmd_chunk = if chunks.len() > 3 { chunks[3] } else { chunks[1] };
+
+    if state.fullscreen_player && state.show_popup {
+        render_view = true;
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)])
+            .split(f.area());
+            
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(15), Constraint::Percentage(70), Constraint::Percentage(15)])
+            .split(popup_layout[1])[1];
+            
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(if is_vim_cmd { 1 } else { 0 })])
+            .split(popup_area);
+            
+        actual_view_chunk = inner_chunks[0];
+        actual_cmd_chunk = inner_chunks[1];
+        
+        // Strip natively via clear
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+        // Paint a light translucent background natively mapped via Empty Block
+        f.render_widget(Block::default().style(Style::default().bg(ratatui::style::Color::Black)), popup_area);
+    }
+
     if !state.fullscreen_player {
-    // Top banner
-    let nav_hint = match state.current_view {
-        View::Playlists => "(↑/↓ Nav, +/- Vol, s Search, o Others, r Refresh, Enter View, i Mode, q Quit)",
-        View::Tracks { is_searching, .. } => {
-            if is_searching { "(Type to search, Enter/Esc to exit search)" }
-            else { "(↑/↓ Nav, +/- Vol, / Search, a Add, Esc Edit, Enter PLAY, i Mode, q Quit)" }
-        }
-        View::SearchGlobal { is_typing, .. } => {
-            if is_typing { "(Type to search... Enter to search, Esc Back)" }
-            else { "(↑/↓ Nav, Enter PLAY, a Add Playlist, s Search, Esc Back)" }
-        }
-        View::SelectPlaylist { .. } => "(↑/↓ Nav, Enter Select, Esc Back)",
-        View::LoadingTracks { .. } => "(Loading...)",
-    };
-    
-    let welcome_msg = format!("SpotMe Client - Welcome, {}! {}", state.display_name, nav_hint);
-    let banner = Paragraph::new(welcome_msg)
-        .block(Block::default().borders(Borders::ALL).title("User Info"))
-        .style(Style::default().fg(Color::Cyan));
-    f.render_widget(banner, chunks[0]);
-
-    // Active View
-    match &mut state.current_view {
-        View::Playlists => {
-            let items: Vec<ListItem> = state.filtered_playlists
-                .iter()
-                .map(|p| ListItem::new(p.name.clone()))
-                .collect();
-
-            let playlist_list = List::new(items)
-                .block(Block::default().title("Your Playlists").borders(Borders::ALL))
-                .style(Style::default().fg(Color::White))
-                .highlight_style(Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD))
-                .highlight_symbol(">> ");
-
-            f.render_stateful_widget(playlist_list, chunks[1], &mut state.playlist_state);
-        }
-        View::LoadingTracks { spinner_tick } => {
-            let spinner = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-            let idx = (*spinner_tick as usize) % spinner.len();
-            
-            let p = Paragraph::new(format!("{} Loading tracks...", spinner[idx]))
-                .block(Block::default().borders(Borders::ALL).title("Loading"))
-                .style(Style::default().fg(Color::Yellow));
-                
-            f.render_widget(p, chunks[1]);
-        }
-        View::Tracks { playlist_id: _, playlist_name, tracks, state: list_state, search_query, is_searching } => {
-            let items: Vec<ListItem> = tracks
-                .iter()
-                .map(|t| {
-                    let metadata = format!("{} | {} ({})", t.artist, t.album, format_duration(t.duration_ms));
-                    let line1 = Line::from(Span::styled(t.name.clone(), Style::default().add_modifier(Modifier::BOLD)));
-                    let line2 = Line::from(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
-                    ListItem::new(vec![line1, line2])
-                })
-                .collect();
-
-            let title = format!("Tracks in {}", playlist_name);
-
-            let tracks_list = List::new(items)
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .style(Style::default().fg(Color::White))
-                .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
-                .highlight_symbol(">> ");
-
-            f.render_stateful_widget(tracks_list, chunks[1], list_state);
-            
-            // Render vim command bar in chunks[3]
-            if *is_searching || !search_query.is_empty() {
-                let cursor = if *is_searching { "█" } else { "" };
-                let cmd_text = format!("/{}{}", search_query, cursor);
-                let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
-                if chunks.len() > 3 {
-                    f.render_widget(p, chunks[3]);
-                }
+        // Top banner
+        let nav_hint = match state.current_view {
+            View::Playlists => "(↑/↓ Nav, +/- Vol, s Search, o Others, b Featured, e Queue, r Refresh, Enter View, i Mode, q Quit)",
+            View::Tracks { is_searching, .. } => {
+                if is_searching { "(Type to search, Enter/Esc to exit search)" }
+                else { "(↑/↓ Nav, +/- Vol, / Search, A Album, a Add, e Queue, Esc Edit, Enter PLAY, i Mode, q Quit)" }
             }
-        }
-        View::SearchGlobal { query, tracks, state: list_state, is_typing } => {
-            let title = if *is_typing { "Global Search (Typing...)" } else { "Global Search" };
-            let display_text = if let Some(t) = tracks {
-                if t.is_empty() {
-                    vec![ListItem::new("No results found.")]
-                } else {
-                    t.iter()
-                    .map(|tr| {
-                        let metadata = format!("{} | {} ({})", tr.artist, tr.album, format_duration(tr.duration_ms));
-                        let line1 = Line::from(Span::styled(tr.name.clone(), Style::default().add_modifier(Modifier::BOLD)));
+            View::SearchGlobal { is_typing, .. } => {
+                if is_typing { "(Type to search... Enter to search, Esc Back)" }
+                else { "(↑/↓ Nav, Enter PLAY, a Add Playlist, s Search, Esc Back)" }
+            }
+            View::SelectPlaylist { .. } => "(↑/↓ Nav, Enter Select, Esc Back)",
+            View::LoadingTracks { .. } => "(Loading...)",
+        };
+        
+        let welcome_msg = format!("SpotMe Client - Welcome, {}! {}", state.display_name, nav_hint);
+        let banner = Paragraph::new(welcome_msg)
+            .block(Block::default().borders(Borders::ALL).title("User Info"))
+            .style(Style::default().fg(Color::Cyan));
+        f.render_widget(banner, chunks[0]);
+    }
+
+    if render_view {
+        // Active View
+        match &mut state.current_view {
+            View::Playlists => {
+                let items: Vec<ListItem> = state.filtered_playlists
+                    .iter()
+                    .map(|p| ListItem::new(p.name.clone()))
+                    .collect();
+
+                let playlist_list = List::new(items)
+                    .block(Block::default().title("Your Playlists").borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().bg(Color::Green).fg(Color::Black).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(">> ");
+
+                f.render_stateful_widget(playlist_list, actual_view_chunk, &mut state.playlist_state);
+            }
+            View::LoadingTracks { spinner_tick } => {
+                let spinner = vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let idx = (*spinner_tick as usize) % spinner.len();
+                
+                let p = Paragraph::new(format!("{} Loading tracks...", spinner[idx]))
+                    .block(Block::default().borders(Borders::ALL).title("Loading"))
+                    .style(Style::default().fg(Color::Yellow));
+                    
+                f.render_widget(p, actual_view_chunk);
+            }
+            View::Tracks { playlist_id: _, playlist_name, tracks, state: list_state, search_query, is_searching } => {
+                let items: Vec<ListItem> = tracks
+                    .iter()
+                    .map(|t| {
+                        let metadata = format!("{} | {} ({})", t.artist, t.album, format_duration(t.duration_ms));
+                        let line1 = Line::from(Span::styled(t.name.clone(), Style::default().add_modifier(Modifier::BOLD)));
                         let line2 = Line::from(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
                         ListItem::new(vec![line1, line2])
                     })
-                    .collect()
-                }
-            } else {
-                vec![ListItem::new("Enter a query to search Spotify network...")]
-            };
+                    .collect();
 
-            let tracks_list = List::new(display_text)
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .style(Style::default().fg(Color::White))
-                .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD))
-                .highlight_symbol(">> ");
+                let title = format!("Tracks in {}", playlist_name);
 
-            f.render_stateful_widget(tracks_list, chunks[1], list_state);
+                let tracks_list = List::new(items)
+                    .block(Block::default().title(title).borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().bg(Color::Magenta).fg(Color::Black))
+                    .highlight_symbol(">> ");
 
-            if *is_typing || !query.is_empty() {
-                let cursor = if *is_typing { "█" } else { "" };
-                let cmd_text = format!("Search: {}{}", query, cursor);
-                let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
-                if chunks.len() > 3 {
-                    f.render_widget(p, chunks[3]);
+                f.render_stateful_widget(tracks_list, actual_view_chunk, list_state);
+                
+                // Render vim command bar
+                if *is_searching || !search_query.is_empty() {
+                    let cursor = if *is_searching { "█" } else { "" };
+                    let cmd_text = format!("/{}{}", search_query, cursor);
+                    let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
+                    f.render_widget(p, actual_cmd_chunk);
                 }
             }
-        }
-        View::SelectPlaylist { track_name, state: list_state, .. } => {
-            let items: Vec<ListItem> = state.filtered_playlists
-                .iter()
-                .map(|p| ListItem::new(p.name.clone()))
-                .collect();
+            View::SearchGlobal { query, tracks, state: list_state, is_typing } => {
+                let title = if *is_typing { "Global Search (Typing...)" } else { "Global Search" };
+                let display_text = if let Some(t) = tracks {
+                    if t.is_empty() {
+                        vec![ListItem::new("No results found.")]
+                    } else {
+                        t.iter()
+                        .map(|tr| {
+                            let metadata = format!("{} | {} ({})", tr.artist, tr.album, format_duration(tr.duration_ms));
+                            let line1 = Line::from(Span::styled(tr.name.clone(), Style::default().add_modifier(Modifier::BOLD)));
+                            let line2 = Line::from(Span::styled(metadata, Style::default().fg(Color::DarkGray)));
+                            ListItem::new(vec![line1, line2])
+                        })
+                        .collect()
+                    }
+                } else {
+                    vec![ListItem::new("Enter a query to search Spotify network...")]
+                };
 
-            let title = format!("Add '{}' to Playlist", track_name);
-            let playlist_list = List::new(items)
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .style(Style::default().fg(Color::White))
-                .highlight_style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
-                .highlight_symbol(">> ");
+                let tracks_list = List::new(display_text)
+                    .block(Block::default().title(title).borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().bg(Color::Blue).fg(Color::Black).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(">> ");
 
-            f.render_stateful_widget(playlist_list, chunks[1], list_state);
+                f.render_stateful_widget(tracks_list, actual_view_chunk, list_state);
+
+                if *is_typing || !query.is_empty() {
+                    let cursor = if *is_typing { "█" } else { "" };
+                    let cmd_text = format!("Search: {}{}", query, cursor);
+                    let p = Paragraph::new(cmd_text).style(Style::default().fg(Color::Yellow));
+                    f.render_widget(p, actual_cmd_chunk);
+                }
+            }
+            View::SelectPlaylist { track_name, state: list_state, .. } => {
+                let items: Vec<ListItem> = state.filtered_playlists
+                    .iter()
+                    .map(|p| ListItem::new(p.name.clone()))
+                    .collect();
+
+                let title = format!("Add '{}' to Playlist", track_name);
+                let playlist_list = List::new(items)
+                    .block(Block::default().title(title).borders(Borders::ALL))
+                    .style(Style::default().fg(Color::White))
+                    .highlight_style(Style::default().bg(Color::Red).fg(Color::White).add_modifier(Modifier::BOLD))
+                    .highlight_symbol(">> ");
+
+                f.render_stateful_widget(playlist_list, actual_view_chunk, list_state);
+            }
         }
     }
-    } // End if !state.fullscreen_player
 
     // Bottom Player Box
     let player_block = Block::default().borders(Borders::ALL);
@@ -2072,5 +2381,49 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         let text = Paragraph::new("\n  No track currently playing. Select a track and press Enter to begin playback.")
             .style(Style::default().fg(Color::DarkGray));
         f.render_widget(text, inner_area);
+    }
+
+    if state.show_help {
+        let help_text = vec![
+            Line::from(vec![Span::styled(" SpotMe Shortcuts ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))]),
+            Line::from(""),
+            Line::from(vec![Span::styled("Global / Playback", Style::default().add_modifier(Modifier::UNDERLINED))]),
+            Line::from("  Space      : Play/Pause"),
+            Line::from("  n / p      : Next / Previous Track"),
+            Line::from("  ← / →      : Seek -5s / +5s"),
+            Line::from("  h / l      : Seek -15s / +15s (Or toggle Fullscreen Lyrics via 'l')"),
+            Line::from("  + / -      : Volume Up / Down"),
+            Line::from("  ?          : Toggle this Help Menu"),
+            Line::from("  i          : Cycle Image Renderer Protocol"),
+            Line::from(""),
+            Line::from(vec![Span::styled("Navigation", Style::default().add_modifier(Modifier::UNDERLINED))]),
+            Line::from("  ↑/↓ & j/k  : Navigate Lists / Scroll Fullscreen Lyrics"),
+            Line::from("  Enter      : Select / Play"),
+            Line::from("  Esc        : Go Back / Cancel Prompts"),
+            Line::from("  s          : Search Global"),
+            Line::from("  o          : Switch to Playlist Views"),
+            Line::from("  f          : Fullscreen Player Toggle"),
+            Line::from(""),
+            Line::from(vec![Span::styled("Press Esc or ? to close.", Style::default().fg(Color::DarkGray))]),
+        ];
+
+        let popup_layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(15), Constraint::Percentage(70), Constraint::Percentage(15)])
+            .split(f.area());
+            
+        let popup_area = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(25), Constraint::Percentage(50), Constraint::Percentage(25)])
+            .split(popup_layout[1])[1];
+
+        // Explicitly clear background behind the popup so it doesn't mesh with the UI!
+        f.render_widget(ratatui::widgets::Clear, popup_area);
+
+        let p = Paragraph::new(help_text)
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Yellow)).style(Style::default().bg(Color::Reset)))
+            .alignment(ratatui::layout::Alignment::Left);
+        
+        f.render_widget(p, popup_area);
     }
 }
