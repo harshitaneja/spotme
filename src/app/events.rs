@@ -403,8 +403,10 @@ pub fn handle_key_events(
                         jump_to_first_match(tracks, state, search_query);
                     }
                     KeyCode::Char(c) => {
-                        search_query.push(c);
-                        jump_to_first_match(tracks, state, search_query);
+                        if search_query.len() < 200 {
+                            search_query.push(c);
+                            jump_to_first_match(tracks, state, search_query);
+                        }
                     }
                     _ => {}
                 }
@@ -611,7 +613,9 @@ pub fn handle_key_events(
                         query.pop();
                     }
                     KeyCode::Char(c) => {
-                        query.push(c);
+                        if query.len() < 200 {
+                            query.push(c);
+                        }
                     }
                     _ => {}
                 }

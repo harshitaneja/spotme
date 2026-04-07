@@ -485,7 +485,7 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
         safe_query
     );
 
-    app_log(&format!("NETWORK INIT: GET {}", url));
+    app_log("NETWORK INIT: GET /v1/search");
     let res = client
         .get(&url)
         .bearer_auth(token)
@@ -543,8 +543,8 @@ pub async fn add_track_to_playlist_api(
     let payload = serde_json::json!({ "uris": [track_uri] });
 
     let url = format!("{}/v1/playlists/{}/items", crate::api::api_base_url(), playlist_id);
-    app_log(&format!("ADD TRACK INIT: POST {}", url));
-    app_log(&format!("ADD TRACK PAYLOAD: {}", payload));
+    app_log("ADD TRACK INIT: POST /v1/playlists/*/items");
+    app_log("ADD TRACK PAYLOAD: [REDACTED]");
 
     let res = client
         .post(&url)
@@ -555,13 +555,12 @@ pub async fn add_track_to_playlist_api(
         .await?;
 
     let status = res.status();
-    let text = res.text().await.unwrap_or_default();
 
     if status.is_success() {
-        app_log(&format!("ADD TRACK SUCCESS {}: {}", status, text));
+        app_log(&format!("ADD TRACK SUCCESS {}", status));
         Ok(())
     } else {
-        app_log(&format!("ADD TRACK FAULT {}: {}", status, text));
+        app_log(&format!("ADD TRACK FAULT {}", status));
         anyhow::bail!("Failed to add track")
     }
 }
@@ -569,7 +568,7 @@ pub async fn add_track_to_playlist_api(
 pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
     let client = crate::api::get_client();
     let url = format!("{}/v1/me/player/queue", crate::api::api_base_url());
-    app_log(&format!("NETWORK INIT: GET {}", url));
+    app_log("NETWORK INIT: GET /v1/me/player/queue");
     let res = client
         .get(url)
         .bearer_auth(token)

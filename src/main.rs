@@ -41,7 +41,15 @@ fn load_cache() -> AppCache {
 
 fn save_cache(cache: &AppCache) {
     if let Ok(content) = serde_json::to_string(cache) {
-        let _ = std::fs::write(&config::paths().cache_file, content);
+        let cache_path = &config::paths().cache_file;
+        let _ = std::fs::write(cache_path, content);
+        #[cfg(unix)]
+        if let Ok(meta) = std::fs::metadata(cache_path) {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o600);
+            let _ = std::fs::set_permissions(cache_path, perms);
+        }
     }
 }
 
@@ -54,10 +62,16 @@ pub fn get_current_unix_time() -> u64 {
 
 pub fn app_log(msg: &str) {
     use std::io::Write;
+    let log_path = &config::paths().log_file;
+    if let Ok(meta) = std::fs::metadata(log_path) {
+        if meta.len() > 1_000_000 {
+            let _ = std::fs::rename(log_path, log_path.with_extension("log.old"));
+        }
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&config::paths().log_file)
+        .open(log_path)
     {
         let ts = get_current_unix_time();
         let _ = writeln!(file, "[{}] {}", ts, msg);

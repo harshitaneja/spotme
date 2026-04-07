@@ -52,7 +52,7 @@ impl Track {
             .unwrap_or("Unknown Track")
             .to_string();
         let uri = track_obj["uri"].as_str().unwrap_or("").to_string();
-        if uri.is_empty() {
+        if uri.is_empty() || !uri.starts_with("spotify:track:") || uri.len() > 100 {
             return None;
         }
 
