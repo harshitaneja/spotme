@@ -494,7 +494,7 @@ pub fn ui(f: &mut Frame, state: &mut AppState) {
         f.render_widget(right_status, status_split[1]);
 
         if state.fullscreen_player && has_lyrics {
-            let lyrics_chunk = lyrics_area.unwrap();
+            let lyrics_chunk = lyrics_area.unwrap_or_default();
             let lyrics_block = Block::default()
                 .borders(Borders::NONE)
                 .padding(ratatui::widgets::Padding::new(0, 0, 1, 0));

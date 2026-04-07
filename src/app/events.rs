@@ -101,7 +101,9 @@ pub fn handle_key_events(
                     let seek_ms = player
                         .progress_ms
                         .saturating_sub(crate::config::SEEK_SHORT_MS);
-                    app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.progress_ms = seek_ms;
+                    }
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
                     });
@@ -115,7 +117,9 @@ pub fn handle_key_events(
                         player.progress_ms + crate::config::SEEK_SHORT_MS,
                         player.duration_ms,
                     );
-                    app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.progress_ms = seek_ms;
+                    }
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
                     });
@@ -128,7 +132,9 @@ pub fn handle_key_events(
                     let seek_ms = player
                         .progress_ms
                         .saturating_sub(crate::config::SEEK_LONG_MS);
-                    app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.progress_ms = seek_ms;
+                    }
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
                     });
@@ -146,7 +152,9 @@ pub fn handle_key_events(
                         player.progress_ms + crate::config::SEEK_LONG_MS,
                         player.duration_ms,
                     );
-                    app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.progress_ms = seek_ms;
+                    }
                     tokio::spawn(async move {
                         let _ = seek_playback(&token, seek_ms).await;
                     });
@@ -187,7 +195,9 @@ pub fn handle_key_events(
                     let token = app_state.access_token.clone();
                     let vol =
                         std::cmp::min(player.volume_percent + crate::config::VOLUME_STEP, 100);
-                    app_state.player_state.as_mut().unwrap().volume_percent = vol;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.volume_percent = vol;
+                    }
                     tokio::spawn(async move {
                         let _ = set_volume(&token, vol).await;
                     });
@@ -199,7 +209,9 @@ pub fn handle_key_events(
                     let vol = player
                         .volume_percent
                         .saturating_sub(crate::config::VOLUME_STEP);
-                    app_state.player_state.as_mut().unwrap().volume_percent = vol;
+                    if let Some(ref mut ps) = app_state.player_state {
+                        ps.volume_percent = vol;
+                    }
                     tokio::spawn(async move {
                         let _ = set_volume(&token, vol).await;
                     });
@@ -855,7 +867,7 @@ mod tests {
         
         let key = make_key(KeyCode::Char('q'));
         let result = handle_key_events(key, &mut state, &tx).unwrap();
-        assert_eq!(result, true); // True means exit loop
+        assert!(result); // True means exit loop
     }
 
     #[test]
@@ -868,7 +880,7 @@ mod tests {
         
         let key = make_key(KeyCode::Char('s'));
         let result = handle_key_events(key, &mut state, &tx).unwrap();
-        assert_eq!(result, false);
+        assert!(!result);
 
         match state.current_view {
             View::SearchGlobal { ref query, is_typing, .. } => {

@@ -25,7 +25,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 
             let client = crate::api::get_client();
             let res = client
-                .post(&format!("{}/api/token", crate::api::accounts_base_url()))
+                .post(format!("{}/api/token", crate::api::accounts_base_url()))
                 .form(&[
                     ("grant_type", "refresh_token"),
                     ("refresh_token", &cache.refresh_token),
@@ -155,7 +155,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 
     let client = crate::api::get_client();
     let response = client
-        .post(&format!("{}/api/token", crate::api::accounts_base_url()))
+        .post(format!("{}/api/token", crate::api::accounts_base_url()))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -205,7 +205,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 pub async fn fetch_user_profile(token: &str) -> Result<(String, String)> {
     let client = crate::api::get_client();
     let res = client
-        .get(&format!("{}/v1/me", crate::api::api_base_url()))
+        .get(format!("{}/v1/me", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -232,10 +232,10 @@ pub async fn start_librespot_daemon(
     // Connect Session
     let session = Session::new(session_config, None);
 
-    let backend = audio_backend::find(None).expect("No audio backend found");
+    let backend = audio_backend::find(None).ok_or_else(|| anyhow::anyhow!("No audio backend found"))?;
     let player_config = PlayerConfig::default();
 
-    let mixer_fn = mixer::find(Some("softvol")).expect("No softvol mixer found");
+    let mixer_fn = mixer::find(Some("softvol")).ok_or_else(|| anyhow::anyhow!("No softvol mixer found"))?;
     let mixer_for_player = mixer_fn(MixerConfig::default())?;
 
     let player = Player::new(
@@ -283,7 +283,7 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
     let mut device_id = None;
     for _ in 0..5 {
         if let Ok(res) = client
-            .get(&format!("{}/v1/me/player/devices", crate::api::api_base_url()))
+            .get(format!("{}/v1/me/player/devices", crate::api::api_base_url()))
             .bearer_auth(token)
             .send()
             .await
@@ -337,7 +337,7 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
 pub async fn pause_playback(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .put(&format!("{}/v1/me/player/pause", crate::api::api_base_url()))
+        .put(format!("{}/v1/me/player/pause", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -347,7 +347,7 @@ pub async fn pause_playback(token: &str) -> Result<(), anyhow::Error> {
 pub async fn resume_playback(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .put(&format!("{}/v1/me/player/play", crate::api::api_base_url()))
+        .put(format!("{}/v1/me/player/play", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -366,7 +366,7 @@ pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::
 pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .post(&format!("{}/v1/me/player/next", crate::api::api_base_url()))
+        .post(format!("{}/v1/me/player/next", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -376,7 +376,7 @@ pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
 pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .post(&format!("{}/v1/me/player/previous", crate::api::api_base_url()))
+        .post(format!("{}/v1/me/player/previous", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;

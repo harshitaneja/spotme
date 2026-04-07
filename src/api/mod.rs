@@ -10,7 +10,7 @@ pub fn get_client() -> reqwest::Client {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .expect("Failed to build global HTTP client")
+                .unwrap_or_default()
         })
         .clone()
 }

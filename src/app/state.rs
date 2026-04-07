@@ -145,6 +145,29 @@ impl AppState {
     }
 }
 
+// Async Message passing
+pub enum AppMessage {
+    TracksFetched {
+        playlist_id: String,
+        playlist_name: String,
+        tracks: Vec<Track>,
+    },
+    FetchError(String),
+    UpdatePlayerState(Option<PlayerState>),
+    UpdateAlbumArt(String, Vec<u8>),
+    PlaylistsRefreshed(Vec<Playlist>),
+    SearchResults(Vec<Track>),
+    SearchError(String),
+    TrackAddedToPlaylist(String),
+    LyricsLoaded(Result<Lyrics, String>),
+    QueueFetched(Result<Vec<Track>, String>),
+    FeaturedFetched(Vec<Playlist>),
+    AlbumTracksFetched {
+        album_name: String,
+        tracks: Result<Vec<Track>, String>,
+    },
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -228,7 +251,7 @@ pub mod tests {
         });
         state.merge_incoming_player_state(incoming_same, 101);
         let merged = state.player_state.as_ref().unwrap();
-        assert_eq!(merged.is_playing, true); // Kept from local
+        assert!(merged.is_playing); // Kept from local
         assert_eq!(merged.volume_percent, 50); // Kept from local
         assert_eq!(merged.progress_ms, 1000); // Kept from local
 
@@ -251,27 +274,4 @@ pub mod tests {
         assert_eq!(final_state.track_name, "Different");
         assert_eq!(final_state.volume_percent, 100);
     }
-}
-
-// Async Message passing
-pub enum AppMessage {
-    TracksFetched {
-        playlist_id: String,
-        playlist_name: String,
-        tracks: Vec<Track>,
-    },
-    FetchError(String),
-    UpdatePlayerState(Option<PlayerState>),
-    UpdateAlbumArt(String, Vec<u8>),
-    PlaylistsRefreshed(Vec<Playlist>),
-    SearchResults(Vec<Track>),
-    SearchError(String),
-    TrackAddedToPlaylist(String),
-    LyricsLoaded(Result<Lyrics, String>),
-    QueueFetched(Result<Vec<Track>, String>),
-    FeaturedFetched(Vec<Playlist>),
-    AlbumTracksFetched {
-        album_name: String,
-        tracks: Result<Vec<Track>, String>,
-    },
 }
