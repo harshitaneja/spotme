@@ -137,12 +137,17 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
     hasher.update(code_verifier.as_bytes());
     let code_challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
+    // Generate CSRF state parameter
+    let mut state_bytes = [0u8; 16];
+    rng.fill(&mut state_bytes);
+    let oauth_state = URL_SAFE_NO_PAD.encode(state_bytes);
+
     let scopes = "user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-modify-playback-state user-read-playback-state streaming";
     let enc_redirect = urlencoding::encode(redirect_uri);
     let enc_scopes = urlencoding::encode(scopes);
 
-    let auth_url = format!("{}/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&show_dialog=true", crate::api::accounts_base_url(),
-        client_id, enc_redirect, enc_scopes, code_challenge
+    let auth_url = format!("{}/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&state={}&show_dialog=true", crate::api::accounts_base_url(),
+        client_id, enc_redirect, enc_scopes, code_challenge, oauth_state
     );
 
     println!("Opening Spotify login in your browser...");
@@ -182,11 +187,15 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let request = String::from_utf8_lossy(&buf[..n]);
 
-                    let mut auth_code = "".to_string();
+                    let mut auth_code = String::new();
+                    let mut returned_state = String::new();
                     for line in request.lines() {
-                        if line.starts_with("GET ") && line.contains("code=") {
+                        if line.starts_with("GET ") {
                             if let Some(idx) = line.find("code=") {
                                 auth_code = line[idx + 5..].split('&').next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
+                            }
+                            if let Some(idx) = line.find("state=") {
+                                returned_state = line[idx + 6..].split('&').next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
                             }
                             break;
                         }
@@ -195,6 +204,9 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
                     let response_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1 style=\"font-family: sans-serif\">SpotMe Login Successful!</h1><p style=\"font-family: sans-serif\">You can safely close this tab and return to the terminal.</p><script>window.close();</script></body></html>";
                     let _ = socket.write_all(response_html.as_bytes()).await;
 
+                    if returned_state != oauth_state {
+                        return Err(anyhow::anyhow!("OAuth state mismatch — possible CSRF attack. Please try again."));
+                    }
                     if auth_code.is_empty() { return Err(anyhow::anyhow!("Could not extract code from callback request!")); }
                     auth_code
                 }
@@ -327,7 +339,7 @@ pub async fn start_librespot_daemon(
 }
 
 // Playback API Commands
-pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), anyhow::Error> {
+pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
 
     // Find our specific Local SpotMe daemon device to ensure music originates here
@@ -369,61 +381,86 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
     let body = serde_json::json!({ "uris": [uri], "position_ms": position_ms });
     let req_res = client.put(&url).bearer_auth(token).json(&body).send().await;
 
-    match req_res {
-        Ok(r) => {
-            crate::app_log(&format!("Play request sent. Status: {}", r.status()));
-        }
-        Err(e) => {
-            crate::app_log(&format!("Play request FAILED: {}", e));
-        }
+    let r = req_res?;
+    let status = r.status();
+    crate::app_log(&format!("Play request sent. Status: {}", status));
+    if !status.is_success() && status != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: status.as_u16(),
+            message: "Playback start failed".to_string(),
+        });
     }
     Ok(())
 }
 
-pub async fn pause_playback(token: &str) -> Result<(), anyhow::Error> {
+pub async fn pause_playback(token: &str) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
-    client
+    let r = client
         .put(format!("{}/v1/me/player/pause", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Pause failed".to_string(),
+        });
+    }
     Ok(())
 }
 
-pub async fn resume_playback(token: &str) -> Result<(), anyhow::Error> {
+pub async fn resume_playback(token: &str) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
-    client
+    let r = client
         .put(format!("{}/v1/me/player/play", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Resume failed".to_string(),
+        });
+    }
     Ok(())
 }
 
-pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Error> {
+pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
     let url = format!(
         "{}/v1/me/player/seek?position_ms={}",
         crate::api::api_base_url(),
         position_ms
     );
-    client.put(&url).bearer_auth(token).send().await?;
+    let r = client.put(&url).bearer_auth(token).send().await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Seek failed".to_string(),
+        });
+    }
     Ok(())
 }
 
-pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
+pub async fn next_track(token: &str) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
-    client
+    let r = client
         .post(format!("{}/v1/me/player/next", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Next track failed".to_string(),
+        });
+    }
     Ok(())
 }
 
-pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
+pub async fn previous_track(token: &str) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
-    client
+    let r = client
         .post(format!(
             "{}/v1/me/player/previous",
             crate::api::api_base_url()
@@ -431,6 +468,12 @@ pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
         .bearer_auth(token)
         .send()
         .await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Previous track failed".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -507,9 +550,7 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
             }
         } else {
             if tracks.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Failed to parse response payload array."
-                ));
+                return Err(anyhow::anyhow!("Failed to parse response payload array."));
             } else {
                 break;
             }
@@ -523,15 +564,13 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
     }
 
     if tracks.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Loaded items but found 0 playable tracks!"
-        ));
+        return Err(anyhow::anyhow!("Loaded items but found 0 playable tracks!"));
     }
 
     Ok(tracks)
 }
 
-pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, String> {
+pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, SpotifyApiError> {
     let client = crate::api::get_client();
     let safe_query = urlencoding::encode(query.trim());
 
@@ -543,38 +582,28 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
     );
 
     app_log("NETWORK INIT: GET /v1/search");
-    let res = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| {
-            let err_str = format!("Req Err: {}", e);
-            app_log(&err_str);
-            err_str
-        })?;
+    let res = client.get(&url).bearer_auth(token).send().await?;
 
     let status = res.status();
     if !status.is_success() {
-        let err_str = format!("Bad Status {}", status);
-        app_log(&format!("NETWORK FAULT: {}", err_str));
-        return Err(err_str);
+        app_log(&format!("NETWORK FAULT: Bad Status {}", status));
+        return Err(SpotifyApiError::BadStatus {
+            status: status.as_u16(),
+            message: "Search request failed".to_string(),
+        });
     }
 
     let text_payload = res
         .text()
         .await
-        .map_err(|e| format!("Text read Err: {}", e))?;
+        .map_err(|e| SpotifyApiError::ParseError(format!("Failed to read response body: {}", e)))?;
     app_log(&format!(
         "NETWORK SUCCESS: Payload Size {}",
         text_payload.len()
     ));
 
-    let json: serde_json::Value = serde_json::from_str(&text_payload).map_err(|e| {
-        let err_str = format!("JSON Err: {}", e);
-        app_log(&err_str);
-        err_str
-    })?;
+    let json: serde_json::Value = serde_json::from_str(&text_payload)
+        .map_err(|e| SpotifyApiError::ParseError(format!("Invalid JSON: {}", e)))?;
 
     let mut tracks = Vec::new();
     if let Some(items) = json["tracks"]["items"].as_array() {
@@ -584,7 +613,9 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
             }
         }
     } else {
-        return Err("Bad payload: no items array in search response.".to_string());
+        return Err(SpotifyApiError::ParseError(
+            "No items array in search response".to_string(),
+        ));
     }
 
     Ok(tracks)
@@ -628,30 +659,24 @@ pub async fn add_track_to_playlist_api(
     }
 }
 
-pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
+pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, SpotifyApiError> {
     let client = crate::api::get_client();
     let url = format!("{}/v1/me/player/queue", crate::api::api_base_url());
     app_log("NETWORK INIT: GET /v1/me/player/queue");
-    let res = client
-        .get(url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("Req Err: {}", e))?;
+    let res = client.get(url).bearer_auth(token).send().await?;
     let status = res.status();
     if !status.is_success() {
-        return Err(format!(
-            "Bad Status {}: {}",
-            status,
-            res.text().await.unwrap_or_default()
-        ));
+        return Err(SpotifyApiError::BadStatus {
+            status: status.as_u16(),
+            message: "Queue fetch failed".to_string(),
+        });
     }
     let text_payload = res
         .text()
         .await
-        .map_err(|e| format!("Text read Err: {}", e))?;
-    let json: serde_json::Value =
-        serde_json::from_str(&text_payload).map_err(|e| format!("JSON Err: {}", e))?;
+        .map_err(|e| SpotifyApiError::ParseError(format!("Body read error: {}", e)))?;
+    let json: serde_json::Value = serde_json::from_str(&text_payload)
+        .map_err(|e| SpotifyApiError::ParseError(format!("Invalid JSON: {}", e)))?;
 
     let mut tracks = Vec::new();
 
@@ -662,27 +687,35 @@ pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
             }
         }
     } else {
-        return Err("Bad payload: no queue array in response.".to_string());
+        return Err(SpotifyApiError::ParseError(
+            "No queue array in response".to_string(),
+        ));
     }
     Ok(tracks)
 }
 
-pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track>, String> {
+pub async fn fetch_album_tracks(
+    token: &str,
+    album_id: &str,
+) -> Result<Vec<Track>, SpotifyApiError> {
     if !is_valid_spotify_id(album_id) {
-        return Err("Invalid album ID".to_string());
+        return Err(SpotifyApiError::InvalidInput(
+            "Invalid album ID".to_string(),
+        ));
     }
     let client = crate::api::get_client();
     let url = format!("{}/v1/albums/{}", crate::api::api_base_url(), album_id);
-    let res = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| format!("Req Err: {}", e))?;
+    let res = client.get(&url).bearer_auth(token).send().await?;
     if !res.status().is_success() {
-        return Err(format!("Bad Status {}", res.status()));
+        return Err(SpotifyApiError::BadStatus {
+            status: res.status().as_u16(),
+            message: "Album fetch failed".to_string(),
+        });
     }
-    let json: serde_json::Value = res.json().await.map_err(|e| format!("JSON Err: {}", e))?;
+    let json: serde_json::Value = res
+        .json()
+        .await
+        .map_err(|e| SpotifyApiError::ParseError(format!("Invalid JSON: {}", e)))?;
 
     let mut tracks = Vec::new();
     let album_name = json["name"].as_str().unwrap_or("").to_string();
@@ -830,12 +863,9 @@ pub async fn fetch_lyrics_api(
     Ok(Lyrics { plain, synced })
 }
 
-pub async fn set_volume(
-    token: &str,
-    percent: u8,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+pub async fn set_volume(token: &str, percent: u8) -> Result<(), SpotifyApiError> {
     let client = crate::api::get_client();
-    client
+    let r = client
         .put(format!(
             "{}/v1/me/player/volume?volume_percent={}",
             crate::api::api_base_url(),
@@ -844,6 +874,12 @@ pub async fn set_volume(
         .bearer_auth(token)
         .send()
         .await?;
+    if !r.status().is_success() && r.status() != reqwest::StatusCode::NO_CONTENT {
+        return Err(SpotifyApiError::BadStatus {
+            status: r.status().as_u16(),
+            message: "Volume change failed".to_string(),
+        });
+    }
     Ok(())
 }
 

@@ -58,7 +58,10 @@ pub fn handle_key_events(
                             let err_tx = tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = pause_playback(&token).await {
-                                    let _ = err_tx.send(AppMessage::StatusError(format!("Pause failed: {}", e)));
+                                    let _ = err_tx.send(AppMessage::StatusError(format!(
+                                        "Pause failed: {}",
+                                        e
+                                    )));
                                 }
                             });
                         }
@@ -70,7 +73,10 @@ pub fn handle_key_events(
                                 let err_tx = tx.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = play_track(&token, &uri, prog).await {
-                                        let _ = err_tx.send(AppMessage::StatusError(format!("Play failed: {}", e)));
+                                        let _ = err_tx.send(AppMessage::StatusError(format!(
+                                            "Play failed: {}",
+                                            e
+                                        )));
                                     }
                                 });
                             } else {
@@ -85,8 +91,12 @@ pub fn handle_key_events(
                                     .await
                                     {
                                         if let Some(first) = tracks.first() {
-                                            if let Err(e) = play_track(&token, &first.uri, prog).await {
-                                                let _ = err_tx.send(AppMessage::StatusError(format!("Play failed: {}", e)));
+                                            if let Err(e) =
+                                                play_track(&token, &first.uri, prog).await
+                                            {
+                                                let _ = err_tx.send(AppMessage::StatusError(
+                                                    format!("Play failed: {}", e),
+                                                ));
                                             }
                                         }
                                     }
@@ -98,7 +108,10 @@ pub fn handle_key_events(
                             let err_tx = tx.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = resume_playback(&token).await {
-                                    let _ = err_tx.send(AppMessage::StatusError(format!("Resume failed: {}", e)));
+                                    let _ = err_tx.send(AppMessage::StatusError(format!(
+                                        "Resume failed: {}",
+                                        e
+                                    )));
                                 }
                             });
                         }
@@ -119,7 +132,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = seek_playback(&token, seek_ms).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
+                            let _ =
+                                err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
                         }
                     });
                 }
@@ -138,7 +152,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = seek_playback(&token, seek_ms).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
+                            let _ =
+                                err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
                         }
                     });
                 }
@@ -156,7 +171,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = seek_playback(&token, seek_ms).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
+                            let _ =
+                                err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
                         }
                     });
                 }
@@ -179,7 +195,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = seek_playback(&token, seek_ms).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
+                            let _ =
+                                err_tx.send(AppMessage::StatusError(format!("Seek failed: {}", e)));
                         }
                     });
                 }
@@ -207,7 +224,8 @@ pub fn handle_key_events(
                 let err_tx = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = next_track(&token).await {
-                        let _ = err_tx.send(AppMessage::StatusError(format!("Next track failed: {}", e)));
+                        let _ = err_tx
+                            .send(AppMessage::StatusError(format!("Next track failed: {}", e)));
                     }
                 });
             }
@@ -216,7 +234,10 @@ pub fn handle_key_events(
                 let err_tx = tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = previous_track(&token).await {
-                        let _ = err_tx.send(AppMessage::StatusError(format!("Previous track failed: {}", e)));
+                        let _ = err_tx.send(AppMessage::StatusError(format!(
+                            "Previous track failed: {}",
+                            e
+                        )));
                     }
                 });
             }
@@ -231,7 +252,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = set_volume(&token, vol).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Volume failed: {}", e)));
+                            let _ = err_tx
+                                .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
                         }
                     });
                 }
@@ -248,7 +270,8 @@ pub fn handle_key_events(
                     let err_tx = tx.clone();
                     tokio::spawn(async move {
                         if let Err(e) = set_volume(&token, vol).await {
-                            let _ = err_tx.send(AppMessage::StatusError(format!("Volume failed: {}", e)));
+                            let _ = err_tx
+                                .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
                         }
                     });
                 }
@@ -270,7 +293,7 @@ pub fn handle_key_events(
                             let _ = tx.send(AppMessage::QueueFetched(Ok(tracks)));
                         }
                         Err(e) => {
-                            let _ = tx.send(AppMessage::QueueFetched(Err(e)));
+                            let _ = tx.send(AppMessage::QueueFetched(Err(e.to_string())));
                         }
                     }
                 });
@@ -507,7 +530,7 @@ pub fn handle_key_events(
                                             Err(e) => {
                                                 let _ = tx.send(AppMessage::AlbumTracksFetched {
                                                     album_name: a_name,
-                                                    tracks: Err(e),
+                                                    tracks: Err(e.to_string()),
                                                 });
                                             }
                                         }
@@ -606,7 +629,10 @@ pub fn handle_key_events(
                                     let err_tx = tx.clone();
                                     tokio::spawn(async move {
                                         if let Err(e) = play_track(&token, &uri, 0).await {
-                                            let _ = err_tx.send(AppMessage::StatusError(format!("Play failed: {}", e)));
+                                            let _ = err_tx.send(AppMessage::StatusError(format!(
+                                                "Play failed: {}",
+                                                e
+                                            )));
                                         }
                                     });
                                 }
@@ -637,7 +663,7 @@ pub fn handle_key_events(
                                         let _ = tx.send(AppMessage::SearchResults(results));
                                     }
                                     Err(e) => {
-                                        let _ = tx.send(AppMessage::SearchError(e));
+                                        let _ = tx.send(AppMessage::SearchError(e.to_string()));
                                     }
                                 }
                             });
@@ -750,7 +776,9 @@ pub fn handle_key_events(
                                         let err_tx = tx.clone();
                                         tokio::spawn(async move {
                                             if let Err(e) = play_track(&token, &uri, 0).await {
-                                                let _ = err_tx.send(AppMessage::StatusError(format!("Play failed: {}", e)));
+                                                let _ = err_tx.send(AppMessage::StatusError(
+                                                    format!("Play failed: {}", e),
+                                                ));
                                             }
                                         });
                                     }

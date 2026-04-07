@@ -70,36 +70,59 @@ pub fn get_current_unix_time() -> u64 {
         .as_secs()
 }
 
+/// Initialize the background log writer thread. Must be called once at startup.
+pub fn init_logger() {
+    use std::sync::mpsc;
+    static LOG_INIT: std::sync::Once = std::sync::Once::new();
+    LOG_INIT.call_once(|| {
+        let (tx, rx) = mpsc::channel::<String>();
+        LOG_TX.set(tx).ok();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            for entry in rx {
+                let log_path = &config::paths().log_file;
+                if let Ok(meta) = std::fs::metadata(log_path) {
+                    if meta.len() > 1_000_000 {
+                        let _ = std::fs::rename(log_path, log_path.with_extension("log.old"));
+                    }
+                }
+                #[cfg(unix)]
+                let file_result = {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .mode(0o600)
+                        .open(log_path)
+                };
+                #[cfg(not(unix))]
+                let file_result = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(log_path);
+                if let Ok(mut file) = file_result {
+                    let _ = writeln!(file, "{}", entry);
+                }
+            }
+        });
+    });
+}
+
+static LOG_TX: std::sync::OnceLock<std::sync::mpsc::Sender<String>> = std::sync::OnceLock::new();
+
+/// Non-blocking log: sends the message to a dedicated writer thread via channel.
+/// Safe to call from both sync and async contexts without blocking tokio executors.
 pub fn app_log(msg: &str) {
-    use std::io::Write;
-    let log_path = &config::paths().log_file;
-    if let Ok(meta) = std::fs::metadata(log_path) {
-        if meta.len() > 1_000_000 {
-            let _ = std::fs::rename(log_path, log_path.with_extension("log.old"));
-        }
-    }
-    #[cfg(unix)]
-    let file_result = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(log_path)
-    };
-    #[cfg(not(unix))]
-    let file_result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path);
-    if let Ok(mut file) = file_result {
+    if let Some(tx) = LOG_TX.get() {
         let ts = get_current_unix_time();
-        let _ = writeln!(file, "[{}] {}", ts, msg);
+        let _ = tx.send(format!("[{}] {}", ts, msg));
     }
 }
 
 async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
+    let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+    let mut background_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
     if let Some(ref ps) = app_state.player_state {
         if let Some(ref url) = ps.album_art_url {
@@ -120,18 +143,38 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
     let poll_token = app_state.access_token.clone();
     let poll_client_id = app_state.client_id.clone();
     let poll_tx = tx.clone();
-    tokio::spawn(async move {
+    let mut poll_shutdown_rx = shutdown_tx.subscribe();
+    let poller_handle = tokio::spawn(async move {
         let client = crate::api::get_client();
         let mut last_art_url: Option<String> = None;
         let mut current_token = poll_token;
+        let mut poll_interval_ms: u64 = 1000;
+        const BASE_INTERVAL_MS: u64 = 1000;
+        const MAX_INTERVAL_MS: u64 = 30_000;
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            tokio::select! {
+                _ = poll_shutdown_rx.changed() => break,
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(poll_interval_ms)) => {}
+            }
             let res = client
                 .get(format!("{}/v1/me/player", crate::api::api_base_url()))
                 .bearer_auth(&current_token)
                 .send()
                 .await;
             if let Ok(r) = res {
+                // Handle 429 Too Many Requests with Retry-After backoff
+                if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .unwrap_or(5);
+                    app_log(&format!("Rate limited, backing off {}s", retry_after));
+                    tokio::time::sleep(tokio::time::Duration::from_secs(retry_after)).await;
+                    poll_interval_ms = (poll_interval_ms * 2).min(MAX_INTERVAL_MS);
+                    continue;
+                }
                 // Refresh token on 401 Unauthorized
                 if r.status() == reqwest::StatusCode::UNAUTHORIZED {
                     if let Some(new_token) =
@@ -139,22 +182,54 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     {
                         current_token = new_token;
                     }
+                    poll_interval_ms = (poll_interval_ms * 2).min(MAX_INTERVAL_MS);
                     continue;
+                }
+                // Successful response — reset interval to base
+                if r.status().is_success() || r.status() == reqwest::StatusCode::NO_CONTENT {
+                    poll_interval_ms = BASE_INTERVAL_MS;
                 }
                 if r.status() == reqwest::StatusCode::NO_CONTENT {
                     let _ = poll_tx.send(AppMessage::UpdatePlayerState(None));
                 } else if let Ok(json) = r.json::<serde_json::Value>().await {
                     let track_obj = &json["item"];
                     if track_obj.is_object() {
-                        let name = track_obj["name"].as_str().unwrap_or("Unknown").to_string();
-                        let artist = track_obj["artists"][0]["name"]
-                            .as_str()
-                            .unwrap_or("Unknown")
-                            .to_string();
-                        let progress = json["progress_ms"].as_u64().unwrap_or(0);
-                        let duration = track_obj["duration_ms"].as_u64().unwrap_or(0);
+                        let name = match track_obj["name"].as_str() {
+                            Some(n) => n.to_string(),
+                            None => {
+                                app_log("PARSE WARN: missing track name in player response");
+                                "Unknown".to_string()
+                            }
+                        };
+                        let artist = match track_obj["artists"][0]["name"].as_str() {
+                            Some(a) => a.to_string(),
+                            None => {
+                                app_log("PARSE WARN: missing artist in player response");
+                                "Unknown".to_string()
+                            }
+                        };
+                        let progress = match json["progress_ms"].as_u64() {
+                            Some(p) => p,
+                            None => {
+                                app_log("PARSE WARN: missing progress_ms, defaulting to 0");
+                                0
+                            }
+                        };
+                        let duration = match track_obj["duration_ms"].as_u64() {
+                            Some(d) => d,
+                            None => {
+                                app_log("PARSE WARN: missing duration_ms, defaulting to 0");
+                                0
+                            }
+                        };
                         let is_playing = json["is_playing"].as_bool().unwrap_or(false);
-                        let volume = json["device"]["volume_percent"].as_u64().unwrap_or(100) as u8;
+                        let volume = match json["device"]["volume_percent"].as_u64() {
+                            Some(v) => v.min(100) as u8,
+                            None => {
+                                app_log("PARSE WARN: missing volume_percent, defaulting to 100");
+                                100
+                            }
+                        };
                         let art_url = track_obj["album"]["images"][0]["url"]
                             .as_str()
                             .map(|s| s.to_string());
@@ -195,9 +270,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(None));
                     }
                 }
+            } else {
+                // Network error — back off
+                poll_interval_ms = (poll_interval_ms * 2).min(MAX_INTERVAL_MS);
             }
         }
     });
+    background_handles.push(poller_handle);
 
     loop {
         // Process async events incoming
@@ -527,8 +606,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     };
                 }
                 AppMessage::StatusError(msg) => {
-                    app_state.status_message =
-                        Some((msg, get_current_unix_time()));
+                    app_state.status_message = Some((msg, get_current_unix_time()));
                 }
                 AppMessage::LyricsLoaded(result) => {
                     let parsed = result.ok();
@@ -575,6 +653,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if crate::app::events::handle_key_events(key, &mut app_state, &tx)? {
+                    // Signal all background tasks to shut down
+                    let _ = shutdown_tx.send(true);
+                    // Give background tasks a moment to finish gracefully
+                    for handle in background_handles {
+                        let _ =
+                            tokio::time::timeout(tokio::time::Duration::from_secs(2), handle).await;
+                    }
                     return Ok(());
                 }
             }
@@ -584,6 +669,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    init_logger();
     dotenv().ok();
     dotenvy::from_path(&crate::config::paths().env_file).ok();
 

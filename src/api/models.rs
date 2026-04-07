@@ -1,4 +1,17 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum SpotifyApiError {
+    #[error("HTTP request failed: {0}")]
+    Network(#[from] reqwest::Error),
+    #[error("API returned status {status}: {message}")]
+    BadStatus { status: u16, message: String },
+    #[error("Failed to parse API response: {0}")]
+    ParseError(String),
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
+}
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct Playlist {
