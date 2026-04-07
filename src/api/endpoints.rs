@@ -14,6 +14,57 @@ use librespot_playback::player::Player;
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+/// Lightweight refresh that reads the cached refresh_token and exchanges it for a new access_token.
+/// Returns the new access token on success, or None if refresh isn't possible.
+pub async fn try_refresh_token(client_id: &str) -> Option<String> {
+    let cache_path = &config::paths().token_cache_file;
+    let content = tokio::fs::read_to_string(cache_path).await.ok()?;
+    let cache: SpotifyTokenCache = serde_json::from_str(&content).ok()?;
+
+    let client = crate::api::get_client();
+    let res = client
+        .post(format!("{}/api/token", crate::api::accounts_base_url()))
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", cache.refresh_token.as_str()),
+            ("client_id", client_id),
+        ])
+        .send()
+        .await
+        .ok()?;
+
+    let json = res.json::<serde_json::Value>().await.ok()?;
+    let access = json["access_token"].as_str()?;
+    let refresh = json["refresh_token"]
+        .as_str()
+        .unwrap_or(&cache.refresh_token);
+    let expires_in = json["expires_in"].as_u64().unwrap_or(3600);
+
+    let new_cache = SpotifyTokenCache {
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        expires_at: get_current_unix_time() + expires_in,
+    };
+
+    if let Ok(cache_str) = serde_json::to_string(&new_cache) {
+        #[cfg(unix)]
+        {
+            let mut opts = tokio::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true).mode(0o600);
+            if let Ok(mut file) = opts.open(cache_path).await {
+                use tokio::io::AsyncWriteExt;
+                let _ = file.write_all(cache_str.as_bytes()).await;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::fs::write(cache_path, &cache_str).await;
+        }
+    }
+
+    Some(access.to_string())
+}
+
 pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result<String> {
     let cache_path = &config::paths().token_cache_file;
 
@@ -51,12 +102,11 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
                         if let Ok(cache_str) = serde_json::to_string(&new_cache) {
                             #[cfg(unix)]
                             {
-                                use std::os::unix::fs::PermissionsExt;
-                                let _ = tokio::fs::write(cache_path, &cache_str).await;
-                                if let Ok(meta) = std::fs::metadata(cache_path) {
-                                    let mut perms = meta.permissions();
-                                    perms.set_mode(0o600);
-                                    let _ = std::fs::set_permissions(cache_path, perms);
+                                let mut opts = tokio::fs::OpenOptions::new();
+                                opts.write(true).create(true).truncate(true).mode(0o600);
+                                if let Ok(mut file) = opts.open(cache_path).await {
+                                    use tokio::io::AsyncWriteExt;
+                                    let _ = file.write_all(cache_str.as_bytes()).await;
                                 }
                             }
                             #[cfg(not(unix))]
@@ -180,12 +230,11 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
         if let Ok(cache_str) = serde_json::to_string(&new_cache) {
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = tokio::fs::write(cache_path, &cache_str).await;
-                if let Ok(meta) = std::fs::metadata(cache_path) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o600);
-                    let _ = std::fs::set_permissions(cache_path, perms);
+                let mut opts = tokio::fs::OpenOptions::new();
+                opts.write(true).create(true).truncate(true).mode(0o600);
+                if let Ok(mut file) = opts.open(cache_path).await {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = file.write_all(cache_str.as_bytes()).await;
                 }
             }
             #[cfg(not(unix))]
@@ -322,18 +371,10 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
 
     match req_res {
         Ok(r) => {
-            let _ = tokio::fs::write(
-                &config::paths().log_file,
-                format!("Play request sent. Status: {}, URL: {}\n", r.status(), url),
-            )
-            .await;
+            crate::app_log(&format!("Play request sent. Status: {}", r.status()));
         }
         Err(e) => {
-            let _ = tokio::fs::write(
-                &config::paths().log_file,
-                format!("Play request FAILED: {}\n", e),
-            )
-            .await;
+            crate::app_log(&format!("Play request FAILED: {}", e));
         }
     }
     Ok(())
@@ -430,7 +471,14 @@ pub async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
     out
 }
 
+fn is_valid_spotify_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 100 && id.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
 pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, anyhow::Error> {
+    if !is_valid_spotify_id(&playlist_id) {
+        return Err(anyhow::anyhow!("Invalid playlist ID"));
+    }
     let client = crate::api::get_client();
     let mut url = format!(
         "{}/v1/playlists/{}/items?market=from_token",
@@ -438,13 +486,10 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
         playlist_id
     );
     let mut tracks = Vec::new();
-    #[allow(unused_assignments)]
-    let mut raw_text_fallback = String::new();
 
     loop {
         let res = client.get(&url).bearer_auth(&token).send().await?;
         let raw_text = res.text().await?;
-        raw_text_fallback = raw_text.clone();
         let json: Value = serde_json::from_str(&raw_text)?;
 
         if let Some(items) = json["items"].as_array() {
@@ -463,8 +508,7 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
         } else {
             if tracks.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "Failed to parse response payload array. Raw: {}",
-                    raw_text
+                    "Failed to parse response payload array."
                 ));
             } else {
                 break;
@@ -480,8 +524,7 @@ pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Trac
 
     if tracks.is_empty() {
         return Err(anyhow::anyhow!(
-            "Loaded items but found 0 playable tracks! Payload: {}",
-            raw_text_fallback.chars().take(2000).collect::<String>()
+            "Loaded items but found 0 playable tracks!"
         ));
     }
 
@@ -513,8 +556,7 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
 
     let status = res.status();
     if !status.is_success() {
-        let txt = res.text().await.unwrap_or_default();
-        let err_str = format!("Bad Status {}: {}", status, txt);
+        let err_str = format!("Bad Status {}", status);
         app_log(&format!("NETWORK FAULT: {}", err_str));
         return Err(err_str);
     }
@@ -542,7 +584,7 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
             }
         }
     } else {
-        return Err(format!("Bad payload: no items array. {}", json));
+        return Err("Bad payload: no items array in search response.".to_string());
     }
 
     Ok(tracks)
@@ -553,6 +595,9 @@ pub async fn add_track_to_playlist_api(
     playlist_id: &str,
     track_uri: &str,
 ) -> Result<(), anyhow::Error> {
+    if !is_valid_spotify_id(playlist_id) {
+        anyhow::bail!("Invalid playlist ID");
+    }
     let client = crate::api::get_client();
     let payload = serde_json::json!({ "uris": [track_uri] });
 
@@ -617,12 +662,15 @@ pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
             }
         }
     } else {
-        return Err(format!("Bad payload: no queue array. {}", json));
+        return Err("Bad payload: no queue array in response.".to_string());
     }
     Ok(tracks)
 }
 
 pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track>, String> {
+    if !is_valid_spotify_id(album_id) {
+        return Err("Invalid album ID".to_string());
+    }
     let client = crate::api::get_client();
     let url = format!("{}/v1/albums/{}", crate::api::api_base_url(), album_id);
     let res = client
@@ -720,6 +768,7 @@ pub async fn fetch_lyrics_api(
     let res = client
         .get(&url)
         .header("User-Agent", "SpotMe/0.1.0")
+        .timeout(std::time::Duration::from_secs(5))
         .send()
         .await?;
 
@@ -764,11 +813,13 @@ pub async fn fetch_lyrics_api(
                                 0
                             };
 
-                            let total_ms = (mins * 60 * 1000) + (secs * 1000) + ms;
-                            lines.push(LrcLine {
-                                time_ms: total_ms,
-                                text,
-                            });
+                            if secs < 60 && mins < 600 {
+                                let total_ms = (mins * 60 * 1000) + (secs * 1000) + ms;
+                                lines.push(LrcLine {
+                                    time_ms: total_ms,
+                                    text,
+                                });
+                            }
                         }
                     }
                 }
@@ -821,7 +872,8 @@ mod tests {
             .create_async()
             .await;
 
-        std::env::set_var("SPOTIFY_API_BASE_URL", server.url());
+        // SAFETY: This test is not run concurrently with other tests that read this env var.
+        unsafe { std::env::set_var("SPOTIFY_API_BASE_URL", server.url()) };
 
         let profile_res = fetch_user_profile("test_token").await.unwrap();
         assert_eq!(profile_res.0, "Mock User");

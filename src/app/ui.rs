@@ -642,6 +642,17 @@ pub fn ui(f: &mut Frame, state: &mut AppState) {
         f.render_widget(text, inner_area);
     }
 
+    // Render transient status/error message
+    if let Some((ref msg, _)) = state.status_message {
+        let status_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .split(f.area());
+        let p = Paragraph::new(format!(" {}", msg))
+            .style(Style::default().fg(Color::Red).bg(Color::Black));
+        f.render_widget(p, status_area[1]);
+    }
+
     if state.show_help {
         let help_text = vec![
             Line::from(vec![Span::styled(

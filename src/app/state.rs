@@ -106,6 +106,8 @@ pub struct AppState {
     pub show_popup: bool,
     pub local_cmd_tx: Option<mpsc::Sender<LocalPlayerCommand>>,
     pub last_action_timestamp: u64,
+    pub client_id: String,
+    pub status_message: Option<(String, u64)>, // (message, timestamp)
 }
 
 impl AppState {
@@ -166,6 +168,7 @@ pub enum AppMessage {
         album_name: String,
         tracks: Result<Vec<Track>, String>,
     },
+    StatusError(String),
 }
 
 #[cfg(test)]
@@ -196,6 +199,8 @@ pub mod tests {
             show_popup: false,
             local_cmd_tx: None,
             last_action_timestamp: 0,
+            client_id: String::new(),
+            status_message: None,
         }
     }
 

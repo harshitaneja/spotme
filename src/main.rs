@@ -42,13 +42,23 @@ fn load_cache() -> AppCache {
 fn save_cache(cache: &AppCache) {
     if let Ok(content) = serde_json::to_string(cache) {
         let cache_path = &config::paths().cache_file;
-        let _ = std::fs::write(cache_path, content);
         #[cfg(unix)]
-        if let Ok(meta) = std::fs::metadata(cache_path) {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = meta.permissions();
-            perms.set_mode(0o600);
-            let _ = std::fs::set_permissions(cache_path, perms);
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(cache_path)
+            {
+                use std::io::Write;
+                let _ = file.write_all(content.as_bytes());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(cache_path, content);
         }
     }
 }
@@ -68,11 +78,21 @@ pub fn app_log(msg: &str) {
             let _ = std::fs::rename(log_path, log_path.with_extension("log.old"));
         }
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+    #[cfg(unix)]
+    let file_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(log_path)
+    };
+    #[cfg(not(unix))]
+    let file_result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(log_path)
-    {
+        .open(log_path);
+    if let Ok(mut file) = file_result {
         let ts = get_current_unix_time();
         let _ = writeln!(file, "[{}] {}", ts, msg);
     }
@@ -98,18 +118,29 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 
     // Start background poller for currently playing track
     let poll_token = app_state.access_token.clone();
+    let poll_client_id = app_state.client_id.clone();
     let poll_tx = tx.clone();
     tokio::spawn(async move {
         let client = crate::api::get_client();
         let mut last_art_url: Option<String> = None;
+        let mut current_token = poll_token;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
             let res = client
-                .get("https://api.spotify.com/v1/me/player")
-                .bearer_auth(&poll_token)
+                .get(format!("{}/v1/me/player", crate::api::api_base_url()))
+                .bearer_auth(&current_token)
                 .send()
                 .await;
             if let Ok(r) = res {
+                // Refresh token on 401 Unauthorized
+                if r.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    if let Some(new_token) =
+                        crate::api::endpoints::try_refresh_token(&poll_client_id).await
+                    {
+                        current_token = new_token;
+                    }
+                    continue;
+                }
                 if r.status() == reqwest::StatusCode::NO_CONTENT {
                     let _ = poll_tx.send(AppMessage::UpdatePlayerState(None));
                 } else if let Ok(json) = r.json::<serde_json::Value>().await {
@@ -441,7 +472,11 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                     };
                 }
                 AppMessage::FeaturedFetched(lists) => {
-                    app_state.app_cache.playlists.extend(lists.clone());
+                    for pl in &lists {
+                        if !app_state.app_cache.playlists.iter().any(|p| p.id == pl.id) {
+                            app_state.app_cache.playlists.push(pl.clone());
+                        }
+                    }
                     app_state.filtered_playlists = lists;
                     app_state
                         .playlist_state
@@ -491,6 +526,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         is_searching: false,
                     };
                 }
+                AppMessage::StatusError(msg) => {
+                    app_state.status_message =
+                        Some((msg, get_current_unix_time()));
+                }
                 AppMessage::LyricsLoaded(result) => {
                     let parsed = result.ok();
                     if let Some(ref mut ps) = app_state.player_state {
@@ -518,6 +557,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
             .unwrap_or(false)
         {
             app_state.player_spinner_tick = app_state.player_spinner_tick.wrapping_add(1);
+        }
+
+        // Clear stale status messages after 5 seconds
+        if let Some((_, ts)) = &app_state.status_message {
+            if get_current_unix_time().saturating_sub(*ts) >= 5 {
+                app_state.status_message = None;
+            }
         }
 
         // Draw UI
@@ -557,10 +603,7 @@ pub async fn main() -> Result<()> {
         let t = access_token.clone();
         tokio::spawn(async move {
             if let Err(e) = start_librespot_daemon(t, cmd_rx).await {
-                let _ = std::fs::write(
-                    &config::paths().log_file,
-                    format!("Librespot error: {}\n", e),
-                );
+                app_log(&format!("Librespot error: {}", e));
             }
         });
     }
@@ -637,6 +680,8 @@ pub async fn main() -> Result<()> {
         show_popup: false,
         local_cmd_tx: Some(cmd_tx),
         last_action_timestamp: 0,
+        client_id,
+        status_message: None,
     };
 
     // TUI setup

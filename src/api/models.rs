@@ -55,6 +55,10 @@ impl Track {
         if uri.is_empty() || !uri.starts_with("spotify:track:") || uri.len() > 100 {
             return None;
         }
+        let id_part = &uri["spotify:track:".len()..];
+        if id_part.is_empty() || !id_part.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
 
         let mut artists = Vec::new();
         if let Some(artists_arr) = track_obj["artists"].as_array() {
