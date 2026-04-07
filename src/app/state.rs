@@ -203,7 +203,7 @@ pub mod tests {
     fn test_merge_player_state_debounce() {
         let mut state = mock_app_state();
         state.last_action_timestamp = 100;
-        
+
         state.player_state = Some(PlayerState {
             track_uri: None,
             track_name: "Original".to_string(),

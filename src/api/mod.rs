@@ -20,5 +20,6 @@ pub fn api_base_url() -> String {
 }
 
 pub fn accounts_base_url() -> String {
-    std::env::var("SPOTIFY_ACCOUNTS_BASE_URL").unwrap_or_else(|_| "https://accounts.spotify.com".to_string())
+    std::env::var("SPOTIFY_ACCOUNTS_BASE_URL")
+        .unwrap_or_else(|_| "https://accounts.spotify.com".to_string())
 }

@@ -65,7 +65,10 @@ mod tests {
             p1.cache_file.to_string_lossy(),
             p2.cache_file.to_string_lossy()
         );
-        assert!(p1.cache_file.to_string_lossy().contains("spotme_cache.json"));
+        assert!(p1
+            .cache_file
+            .to_string_lossy()
+            .contains("spotme_cache.json"));
         assert!(p1.log_file.to_string_lossy().contains("spotme.log"));
         assert!(p1.env_file.to_string_lossy().contains(".env"));
     }

@@ -232,10 +232,12 @@ pub async fn start_librespot_daemon(
     // Connect Session
     let session = Session::new(session_config, None);
 
-    let backend = audio_backend::find(None).ok_or_else(|| anyhow::anyhow!("No audio backend found"))?;
+    let backend =
+        audio_backend::find(None).ok_or_else(|| anyhow::anyhow!("No audio backend found"))?;
     let player_config = PlayerConfig::default();
 
-    let mixer_fn = mixer::find(Some("softvol")).ok_or_else(|| anyhow::anyhow!("No softvol mixer found"))?;
+    let mixer_fn =
+        mixer::find(Some("softvol")).ok_or_else(|| anyhow::anyhow!("No softvol mixer found"))?;
     let mixer_for_player = mixer_fn(MixerConfig::default())?;
 
     let player = Player::new(
@@ -283,7 +285,10 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
     let mut device_id = None;
     for _ in 0..5 {
         if let Ok(res) = client
-            .get(format!("{}/v1/me/player/devices", crate::api::api_base_url()))
+            .get(format!(
+                "{}/v1/me/player/devices",
+                crate::api::api_base_url()
+            ))
             .bearer_auth(token)
             .send()
             .await
@@ -356,7 +361,9 @@ pub async fn resume_playback(token: &str) -> Result<(), anyhow::Error> {
 
 pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
-    let url = format!("{}/v1/me/player/seek?position_ms={}", crate::api::api_base_url(),
+    let url = format!(
+        "{}/v1/me/player/seek?position_ms={}",
+        crate::api::api_base_url(),
         position_ms
     );
     client.put(&url).bearer_auth(token).send().await?;
@@ -376,7 +383,10 @@ pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
 pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .post(format!("{}/v1/me/player/previous", crate::api::api_base_url()))
+        .post(format!(
+            "{}/v1/me/player/previous",
+            crate::api::api_base_url()
+        ))
         .bearer_auth(token)
         .send()
         .await?;
@@ -422,7 +432,9 @@ pub async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
 
 pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, anyhow::Error> {
     let client = crate::api::get_client();
-    let mut url = format!("{}/v1/playlists/{}/items?market=from_token", crate::api::api_base_url(),
+    let mut url = format!(
+        "{}/v1/playlists/{}/items?market=from_token",
+        crate::api::api_base_url(),
         playlist_id
     );
     let mut tracks = Vec::new();
@@ -481,7 +493,9 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
     let safe_query = urlencoding::encode(query.trim());
 
     // Spotify natively defaults to 20 limit. Leaving it omitted bypasses the 400 Bad Request parameter fault.
-    let url = format!("{}/v1/search?q={}&type=track", crate::api::api_base_url(),
+    let url = format!(
+        "{}/v1/search?q={}&type=track",
+        crate::api::api_base_url(),
         safe_query
     );
 
@@ -542,7 +556,11 @@ pub async fn add_track_to_playlist_api(
     let client = crate::api::get_client();
     let payload = serde_json::json!({ "uris": [track_uri] });
 
-    let url = format!("{}/v1/playlists/{}/items", crate::api::api_base_url(), playlist_id);
+    let url = format!(
+        "{}/v1/playlists/{}/items",
+        crate::api::api_base_url(),
+        playlist_id
+    );
     app_log("ADD TRACK INIT: POST /v1/playlists/*/items");
     app_log("ADD TRACK PAYLOAD: [REDACTED]");
 
@@ -636,7 +654,10 @@ pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track
 
 pub async fn fetch_featured_playlists_api(token: &str) -> Vec<Playlist> {
     let client = crate::api::get_client();
-    let url = format!("{}/v1/browse/featured-playlists?limit=50", crate::api::api_base_url());
+    let url = format!(
+        "{}/v1/browse/featured-playlists?limit=50",
+        crate::api::api_base_url()
+    );
     if let Ok(res) = client.get(url).bearer_auth(token).send().await {
         if res.status().is_success() {
             if let Ok(json) = res.json::<serde_json::Value>().await {
@@ -764,7 +785,9 @@ pub async fn set_volume(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = crate::api::get_client();
     client
-        .put(format!("{}/v1/me/player/volume?volume_percent={}", crate::api::api_base_url(),
+        .put(format!(
+            "{}/v1/me/player/volume?volume_percent={}",
+            crate::api::api_base_url(),
             percent
         ))
         .bearer_auth(token)
@@ -781,8 +804,9 @@ mod tests {
     #[tokio::test]
     async fn test_api_endpoints_mocked() {
         let mut server = Server::new_async().await;
-        
-        let mock_profile = server.mock("GET", "/v1/me")
+
+        let mock_profile = server
+            .mock("GET", "/v1/me")
             .match_header("authorization", "Bearer test_token")
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -790,7 +814,8 @@ mod tests {
             .create_async()
             .await;
 
-        let mock_pause = server.mock("PUT", "/v1/me/player/pause")
+        let mock_pause = server
+            .mock("PUT", "/v1/me/player/pause")
             .match_header("authorization", "Bearer test_token")
             .with_status(204)
             .create_async()
