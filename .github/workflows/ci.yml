@@ -1,19 +1,16 @@
 name: CI
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build_and_test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
@@ -32,9 +29,9 @@ jobs:
   security_audit:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     
     - name: Security audit
-      uses: rustsec/audit-check@v1.4.1
+      uses: rustsec/audit-check@v2.0.0
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
