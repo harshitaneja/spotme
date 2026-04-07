@@ -14,7 +14,6 @@ use ratatui::{
     Frame, Terminal,
 };
 use serde_json::Value;
-use std::io::Write;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
 
@@ -60,12 +59,29 @@ struct Track {
     uri: String,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct LrcLine {
+    time_ms: u64,
+    text: String,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Lyrics {
+    plain: Option<String>,
+    synced: Option<Vec<LrcLine>>,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct CachedPlayerState {
+    #[serde(default)]
+    track_uri: Option<String>,
     track_name: String,
     artist: String,
+    #[serde(default)]
+    progress_ms: u64,
     duration_ms: u64,
     album_art_url: Option<String>,
+    lyrics: Option<Lyrics>,
 }
 
 #[derive(Default, Serialize, Deserialize, Clone)]
@@ -79,6 +95,7 @@ struct AppCache {
 #[derive(Clone)]
 #[allow(dead_code)]
 struct PlayerState {
+    track_uri: Option<String>,
     track_name: String,
     artist: String,
     progress_ms: u64,
@@ -87,6 +104,8 @@ struct PlayerState {
     volume_percent: u8,
     album_art_url: Option<String>,
     is_buffering: bool,
+    is_fresh_cache: bool,
+    lyrics: Option<Lyrics>,
 }
 
 // GUI State
@@ -96,6 +115,12 @@ enum View {
     Tracks { playlist_id: String, playlist_name: String, tracks: Vec<Track>, state: ListState, search_query: String, is_searching: bool },
     SearchGlobal { query: String, tracks: Option<Vec<Track>>, state: ListState, is_typing: bool },
     SelectPlaylist { track_uri: String, track_name: String, state: ListState, previous: Box<View> },
+}
+
+#[derive(Clone, PartialEq)]
+enum LyricsMode {
+    Focused,
+    Full,
 }
 
 struct AppState {
@@ -114,8 +139,9 @@ struct AppState {
     current_art_protocol: Option<StatefulProtocol>,
     player_spinner_tick: u8,
     picker: Picker,
-    
     fullscreen_player: bool,
+    lyrics_mode: LyricsMode,
+    lyrics_scroll_offset: usize,
     local_cmd_tx: Option<mpsc::Sender<LocalPlayerCommand>>,
     last_action_timestamp: u64,
 }
@@ -129,7 +155,8 @@ enum AppMessage {
     PlaylistsRefreshed(Vec<Playlist>),
     SearchResults(Vec<Track>),
     SearchError(String),
-    TrackAddedToPlaylist,
+    TrackAddedToPlaylist(String),
+    LyricsLoaded(Result<Lyrics, String>),
 }
 
 fn format_duration(ms: u64) -> String {
@@ -156,6 +183,14 @@ fn save_cache(cache: &AppCache) {
 
 fn get_current_unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+}
+
+pub fn app_log(msg: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("spotme.log") {
+        let ts = get_current_unix_time();
+        let _ = writeln!(file, "[{}] {}", ts, msg);
+    }
 }
 
 async fn get_or_refresh_token(client_id: &str, client_secret: &str, redirect_uri: &str) -> Result<String> {
@@ -199,28 +234,63 @@ async fn get_or_refresh_token(client_id: &str, client_secret: &str, redirect_uri
         }
     }
     
-    let scopes = "user-read-private user-read-email playlist-read-private playlist-read-collaborative user-modify-playback-state user-read-playback-state streaming";
+    let scopes = "user-read-private user-read-email playlist-read-private playlist-read-collaborative playlist-modify-public playlist-modify-private user-modify-playback-state user-read-playback-state streaming";
     let enc_redirect = redirect_uri.replace(":", "%3A").replace("/", "%2F");
     let enc_scopes = scopes.replace(" ", "%20");
     
     let auth_url = format!(
-        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}",
+        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&show_dialog=true",
         client_id, enc_redirect, enc_scopes
     );
     
-    println!("Please open this URL in your browser:");
-    println!("{}", auth_url);
-    print!("Paste the redirected URL here: ");
-    std::io::stdout().flush()?;
+    println!("Opening Spotify login in your browser...");
+    println!("If it doesn't open automatically, please click here: \n{}\n", auth_url);
     
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
-    let input = input.trim();
+    let _ = open::that(&auth_url);
     
-    let code = if let Some(idx) = input.find("code=") {
-        input[idx + 5..].split('&').next().unwrap_or("").to_string()
-    } else {
-        return Err(anyhow::anyhow!("Could not find code in URL"));
+    let url_parts: Vec<&str> = redirect_uri.split(':').collect();
+    let port_part = url_parts.last().unwrap_or(&"8480").split('/').next().unwrap_or("8480");
+    let port_u16 = port_part.parse::<u16>().unwrap_or(8480);
+    
+    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_u16)).await?;
+    
+    println!("Waiting up to 120 seconds for browser authentication... (Press Ctrl+C to cancel)");
+    
+    let code = tokio::select! {
+        _ = tokio::time::sleep(tokio::time::Duration::from_secs(120)) => {
+            return Err(anyhow::anyhow!("Authentication timed out after 120 seconds. Please run SpotMe again."));
+        }
+        accept_res = listener.accept() => {
+            match accept_res {
+                Ok((mut socket, _)) => {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    
+                    let mut auth_code = "".to_string();
+                    for line in request.lines() {
+                        if line.starts_with("GET ") && line.contains("code=") {
+                            if let Some(idx) = line.find("code=") {
+                                auth_code = line[idx + 5..].split('&').next().unwrap_or("").split(' ').next().unwrap_or("").to_string();
+                            }
+                            break;
+                        }
+                    }
+                    
+                    let response_html = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body><h1 style=\"font-family: sans-serif\">SpotMe Login Successful!</h1><p style=\"font-family: sans-serif\">You can safely close this tab and return to the terminal.</p><script>window.close();</script></body></html>";
+                    let _ = socket.write_all(response_html.as_bytes()).await;
+                    
+                    if auth_code.is_empty() {
+                        return Err(anyhow::anyhow!("Could not extract code from callback request!"));
+                    }
+                    auth_code
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Listener failed to accept connection: {}", e));
+                }
+            }
+        }
     };
     
     let client = reqwest::Client::new();
@@ -376,14 +446,17 @@ async fn main() -> Result<()> {
     let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
 
     let initial_player_state = app_cache.last_player.as_ref().map(|cached| PlayerState {
+        track_uri: cached.track_uri.clone(),
         track_name: cached.track_name.clone(),
         artist: cached.artist.clone(),
-        progress_ms: 0,
+        progress_ms: cached.progress_ms,
         duration_ms: cached.duration_ms,
         is_playing: false,
         volume_percent: 50,
         album_art_url: cached.album_art_url.clone(),
         is_buffering: false,
+        is_fresh_cache: true,
+        lyrics: cached.lyrics.clone(),
     });
 
     let app_state = AppState {
@@ -402,6 +475,8 @@ async fn main() -> Result<()> {
         player_spinner_tick: 0,
         picker,
         fullscreen_player: false,
+        lyrics_mode: LyricsMode::Focused,
+        lyrics_scroll_offset: 0,
         local_cmd_tx: Some(cmd_tx),
         last_action_timestamp: 0,
     };
@@ -427,7 +502,7 @@ async fn main() -> Result<()> {
 }
 
 // Playback API Commands
-async fn play_track(token: &str, uri: &str) -> Result<(), anyhow::Error> {
+async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), anyhow::Error> {
     let client = reqwest::Client::new();
     
     // Find our specific Local SpotMe daemon device to ensure music originates here
@@ -461,7 +536,7 @@ async fn play_track(token: &str, uri: &str) -> Result<(), anyhow::Error> {
         url = format!("{}?device_id={}", url, id);
     }
 
-    let body = serde_json::json!({ "uris": [uri] });
+    let body = serde_json::json!({ "uris": [uri], "position_ms": position_ms });
     let req_res = client.put(&url)
         .bearer_auth(token)
         .json(&body)
@@ -598,60 +673,154 @@ async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, 
     Ok(tracks)
 }
 
-async fn search_spotify_api(token: &str, query: &str) -> Vec<Track> {
+fn url_encode(input: &str) -> String {
+    let mut encoded = String::new();
+    for b in input.as_bytes() {
+        match *b {
+            b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => encoded.push(*b as char),
+            b' ' => encoded.push_str("%20"),
+            _ => encoded.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    encoded
+}
+
+async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, String> {
     let client = reqwest::Client::new();
-    let safe_query = query.replace(" ", "%20");
-    let url = format!("https://api.spotify.com/v1/search?q={}&type=track&limit=50", safe_query);
+    let safe_query = url_encode(query.trim());
     
+    // Spotify natively defaults to 20 limit. Leaving it omitted bypasses the 400 Bad Request parameter fault.
+    let url = format!("https://api.spotify.com/v1/search?q={}&type=track", safe_query);
+    
+    app_log(&format!("NETWORK INIT: GET {}", url));
     let res = client.get(&url)
         .bearer_auth(token)
         .send()
-        .await;
+        .await.map_err(|e| {
+            let err_str = format!("Req Err: {}", e);
+            app_log(&err_str);
+            err_str
+        })?;
         
+    let status = res.status();
+    if !status.is_success() {
+        let txt = res.text().await.unwrap_or_default();
+        let err_str = format!("Bad Status {}: {}", status, txt);
+        app_log(&format!("NETWORK FAULT: {}", err_str));
+        return Err(err_str);
+    }
+    
+    let text_payload = res.text().await.map_err(|e| format!("Text read Err: {}", e))?;
+    app_log(&format!("NETWORK SUCCESS: Payload Size {}", text_payload.len()));
+    
+    let json: serde_json::Value = serde_json::from_str(&text_payload).map_err(|e| {
+        let err_str = format!("JSON Err: {}", e);
+        app_log(&err_str);
+        err_str
+    })?;
+    
     let mut tracks = Vec::new();
-    if let Ok(response) = res {
-        if response.status().is_success() {
-            if let Ok(json) = response.json::<serde_json::Value>().await {
-                if let Some(items) = json["tracks"]["items"].as_array() {
-                    for item in items {
-                        let name = item["name"].as_str().unwrap_or("").to_string();
-                        let uri = item["uri"].as_str().unwrap_or("").to_string();
-                        let duration_ms = item["duration_ms"].as_u64().unwrap_or(0);
-                        
-                        let mut artist_names: Vec<String> = Vec::new();
-                        if let Some(artists) = item["artists"].as_array() {
-                            for a in artists {
-                                if let Some(n) = a["name"].as_str() {
-                                    artist_names.push(n.to_string());
-                                }
-                            }
-                        }
-                        
-                        let album = item["album"]["name"].as_str().unwrap_or("").to_string();
-                        tracks.push(Track { name, artist: artist_names.join(", "), album, duration_ms, uri });
+    if let Some(items) = json["tracks"]["items"].as_array() {
+        for item in items {
+            let name = item["name"].as_str().unwrap_or("").to_string();
+            let uri = item["uri"].as_str().unwrap_or("").to_string();
+            let duration_ms = item["duration_ms"].as_u64().unwrap_or(0);
+            
+            let mut artist_names: Vec<String> = Vec::new();
+            if let Some(artists) = item["artists"].as_array() {
+                for a in artists {
+                    if let Some(n) = a["name"].as_str() {
+                        artist_names.push(n.to_string());
                     }
                 }
             }
+            
+            let album = item["album"]["name"].as_str().unwrap_or("").to_string();
+            tracks.push(Track { name, artist: artist_names.join(", "), album, duration_ms, uri });
         }
+    } else {
+        return Err(format!("Bad payload: no items array. {}", json));
     }
-    tracks
+    
+    Ok(tracks)
 }
 
 async fn add_track_to_playlist_api(token: &str, playlist_id: &str, track_uri: &str) -> Result<(), anyhow::Error> {
     let client = reqwest::Client::new();
     let payload = serde_json::json!({ "uris": [track_uri] });
-    let res = client.post(&format!("https://api.spotify.com/v1/playlists/{}/tracks", playlist_id))
+    
+    let url = format!("https://api.spotify.com/v1/playlists/{}/items", playlist_id);
+    app_log(&format!("ADD TRACK INIT: POST {}", url));
+    app_log(&format!("ADD TRACK PAYLOAD: {}", payload));
+    
+    let res = client.post(&url)
         .bearer_auth(token)
         .header("Content-Type", "application/json")
         .json(&payload)
         .send()
         .await?;
         
-    if res.status().is_success() {
+    let status = res.status();
+    let text = res.text().await.unwrap_or_default();
+    
+    if status.is_success() {
+        app_log(&format!("ADD TRACK SUCCESS {}: {}", status, text));
         Ok(())
     } else {
+        app_log(&format!("ADD TRACK FAULT {}: {}", status, text));
         anyhow::bail!("Failed to add track")
     }
+}
+
+async fn fetch_lyrics_api(track_name: &str, artist_name: &str) -> Result<Lyrics, anyhow::Error> {
+    app_log(&format!("FETCH LYRICS INIT: {} - {}", track_name, artist_name));
+    
+    let clean_track = track_name.split(" - ").next().unwrap_or(track_name).to_string();
+    let clean_artist = artist_name.split(',').next().unwrap_or(artist_name).to_string();
+    
+    let client = reqwest::Client::new();
+    let url = format!("https://lrclib.net/api/get?track_name={}&artist_name={}", urlencoding::encode(&clean_track), urlencoding::encode(&clean_artist));
+    let res = client.get(&url).header("User-Agent", "SpotMe/0.1.0").send().await?;
+    
+    if !res.status().is_success() {
+        app_log(&format!("FETCH LYRICS FAULT {}: {}", res.status(), res.text().await.unwrap_or_default()));
+        return Err(anyhow::anyhow!("Lyrics not found"));
+    }
+    
+    let text = res.text().await?;
+    app_log(&format!("FETCH LYRICS SUCCESS: {}", text.len()));
+    let json: serde_json::Value = serde_json::from_str(&text)?;
+    
+    let plain = json["plainLyrics"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string());
+    
+    let synced = json["syncedLyrics"].as_str().filter(|s| !s.is_empty()).map(|s| {
+        let mut lines = Vec::new();
+        for line in s.lines() {
+            if line.starts_with('[') {
+                if let Some(close_idx) = line.find(']') {
+                    let ts = &line[1..close_idx];
+                    let text = line[close_idx + 1..].trim().to_string();
+                    
+                    let parts: Vec<&str> = ts.split(':').collect();
+                    if parts.len() == 2 {
+                        let mins = parts[0].parse::<u64>().unwrap_or(0);
+                        let secs_parts: Vec<&str> = parts[1].split('.').collect();
+                        let secs = secs_parts[0].parse::<u64>().unwrap_or(0);
+                        let ms = if secs_parts.len() == 2 {
+                            let frac_str = format!("{:0<3}", secs_parts[1]);
+                            frac_str[0..3].parse::<u64>().unwrap_or(0)
+                        } else { 0 };
+                        
+                        let total_ms = (mins * 60 * 1000) + (secs * 1000) + ms;
+                        lines.push(LrcLine { time_ms: total_ms, text });
+                    }
+                }
+            }
+        }
+        lines
+    });
+    
+    Ok(Lyrics { plain, synced })
 }
 
 async fn set_volume(token: &str, percent: u8) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -733,9 +902,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         let is_playing = json["is_playing"].as_bool().unwrap_or(false);
                         let volume = json["device"]["volume_percent"].as_u64().unwrap_or(100) as u8;
                         let art_url = track_obj["album"]["images"][0]["url"].as_str().map(|s| s.to_string());
+                        let uri = track_obj["uri"].as_str().map(|s| s.to_string());
                         
                         let _ = poll_tx.send(AppMessage::UpdatePlayerState(Some(PlayerState { 
-                            track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone(), is_buffering: false
+                            track_uri: uri, track_name: name, artist, progress_ms: progress, duration_ms: duration, is_playing, volume_percent: volume, album_art_url: art_url.clone(), is_buffering: false, is_fresh_cache: false, lyrics: None
                         })));
                         
                         if let Some(url) = art_url {
@@ -813,8 +983,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 }
                 AppMessage::UpdatePlayerState(mut pstate) => {
                     let now = get_current_unix_time();
-                    
-                    if pstate.is_none() && app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+                    if pstate.is_none() {
+                        if app_state.player_state.as_ref().map(|p| p.is_buffering).unwrap_or(false) {
+                            continue;
+                        }
+                        if let Some(ref mut local_ps) = app_state.player_state {
+                            local_ps.is_playing = false;
+                        }
                         continue;
                     }
                     
@@ -841,21 +1016,72 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         }
                     }
                     
+                    if let Some(ref local_ps) = app_state.player_state {
+                        if let Some(ref mut incoming_ps) = pstate {
+                            if incoming_ps.track_name == local_ps.track_name {
+                                incoming_ps.lyrics = local_ps.lyrics.clone();
+                            }
+                        }
+                    }
+                    
                     app_state.player_state = pstate;
                     
-                    if let Some(ref ps) = app_state.player_state {
-                        let cache_changed = match &app_state.app_cache.last_player {
-                            Some(cached) => cached.track_name != ps.track_name,
-                            None => true,
-                        };
-                        if cache_changed {
+                    if let Some(ref mut ps) = app_state.player_state {
+                        let mut cache_dirty = false;
+                        let mut track_changed = false;
+                        
+                        if let Some(cached) = &mut app_state.app_cache.last_player {
+                            if cached.track_name != ps.track_name {
+                                track_changed = true;
+                            }
+                            
+                            if track_changed || (ps.progress_ms as i64 - cached.progress_ms as i64).abs() > 5000 {
+                                cached.track_uri = ps.track_uri.clone();
+                                cached.track_name = ps.track_name.clone();
+                                cached.artist = ps.artist.clone();
+                                cached.progress_ms = ps.progress_ms;
+                                cached.duration_ms = ps.duration_ms;
+                                cached.album_art_url = ps.album_art_url.clone();
+                                cached.lyrics = ps.lyrics.clone();
+                                cache_dirty = true;
+                            }
+                        } else {
                             app_state.app_cache.last_player = Some(CachedPlayerState {
+                                track_uri: ps.track_uri.clone(),
                                 track_name: ps.track_name.clone(),
                                 artist: ps.artist.clone(),
+                                progress_ms: ps.progress_ms,
                                 duration_ms: ps.duration_ms,
                                 album_art_url: ps.album_art_url.clone(),
+                                lyrics: ps.lyrics.clone(),
                             });
+                            track_changed = true;
+                            cache_dirty = true;
+                        }
+                        
+                        let should_fetch = track_changed || ps.lyrics.is_none();
+                        
+                        if cache_dirty {
                             save_cache(&app_state.app_cache);
+                        }
+                        
+                        if should_fetch {
+                            ps.lyrics = Some(Lyrics::default());
+                            
+                            if let Some(ref mut cached) = app_state.app_cache.last_player {
+                                cached.lyrics = Some(Lyrics::default());
+                            }
+                            
+                            let t_name = ps.track_name.clone();
+                            let t_artist = ps.artist.clone();
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                if let Ok(lyrics) = fetch_lyrics_api(&t_name, &t_artist).await {
+                                    let _ = tx.send(AppMessage::LyricsLoaded(Ok(lyrics)));
+                                } else {
+                                    let _ = tx.send(AppMessage::LyricsLoaded(Ok(Lyrics::default())));
+                                }
+                            });
                         }
                     }
                 }
@@ -872,7 +1098,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 if !tracks.is_empty() {
                     list_state.select(Some(0));
                 }
-                if let View::SearchGlobal { ref mut query, tracks: ref mut t, state: ref mut s, ref mut is_typing } = app_state.current_view {
+                if let View::SearchGlobal { query: ref mut _query, tracks: ref mut t, state: ref mut s, ref mut is_typing } = app_state.current_view {
                     *t = Some(tracks);
                     *s = list_state;
                     *is_typing = false;
@@ -886,18 +1112,33 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 }
             }
             AppMessage::SearchError(err) => {
-                if let View::SearchGlobal { ref mut query, tracks: ref mut tracks, state: ref mut s, ref mut is_typing } = app_state.current_view {
+                if let View::SearchGlobal { query: ref mut _query, tracks: ref mut tracks, state: ref mut _s, ref mut is_typing } = app_state.current_view {
                     *tracks = Some(vec![Track { name: format!("Error: {}", err), artist: String::new(), album: String::new(), duration_ms: 0, uri: "".to_string() }]);
                     *is_typing = false;
                 }
             }
-            AppMessage::TrackAddedToPlaylist => {
-                let mut prev_view = None;
+            AppMessage::TrackAddedToPlaylist(playlist_id) => {
+                app_log("TRIGGERED TrackAddedToPlaylist UI Popup Return Constraint!");
+                
+                // Discard stale offline cache for this playlist string targeting to force fresh syncs!
+                app_state.app_cache.tracks.remove(&playlist_id);
+                
+                let mut prev = None;
                 if let View::SelectPlaylist { ref mut previous, .. } = app_state.current_view {
-                    prev_view = Some(std::mem::replace(previous, Box::new(View::Playlists)));
+                    prev = Some(std::mem::replace(previous, Box::new(View::Playlists)));
                 }
-                if let Some(mut boxed_prev) = prev_view {
-                    std::mem::swap(&mut app_state.current_view, &mut boxed_prev);
+                if let Some(p) = prev {
+                    app_state.current_view = *p;
+                }
+            }
+            AppMessage::LyricsLoaded(result) => {
+                let parsed = result.ok();
+                if let Some(ref mut ps) = app_state.player_state {
+                    ps.lyrics = parsed.clone();
+                }
+                if let Some(ref mut cached) = app_state.app_cache.last_player {
+                    cached.lyrics = parsed;
+                    save_cache(&app_state.app_cache);
                 }
             }
         }
@@ -921,12 +1162,23 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                 if let View::Tracks { is_searching, .. } = &app_state.current_view {
                     is_typing = *is_searching;
                 }
-
                 if !is_typing {
+                    if app_state.fullscreen_player && app_state.lyrics_mode == LyricsMode::Full {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app_state.lyrics_scroll_offset = app_state.lyrics_scroll_offset.saturating_sub(1);
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app_state.lyrics_scroll_offset = app_state.lyrics_scroll_offset.saturating_add(1);
+                            }
+                            _ => {}
+                        }
+                    }
+
                     // Global Playback Hotkeys!
                     match key.code {
                     KeyCode::Char(' ') => {
-                        if let Some(player) = &app_state.player_state {
+                        if let Some(player) = &mut app_state.player_state {
                             let token = app_state.access_token.clone();
                             let is_playing = player.is_playing;
                             
@@ -937,13 +1189,29 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                     tokio::spawn(async move { let _ = pause_playback(&token).await; });
                                 }
                             } else { 
-                                if let Some(tx) = &app_state.local_cmd_tx {
+                                if player.is_fresh_cache {
+                                    player.is_fresh_cache = false;
+                                    let prog = player.progress_ms;
+                                    if let Some(uri) = player.track_uri.clone() {
+                                        tokio::spawn(async move { let _ = play_track(&token, &uri, prog).await; });
+                                    } else {
+                                        let t_name = player.track_name.clone();
+                                        let a_name = player.artist.clone();
+                                        tokio::spawn(async move {
+                                            if let Ok(tracks) = search_spotify_api(&token, &format!("{} {}", t_name, a_name)).await {
+                                                if let Some(first) = tracks.first() {
+                                                    let _ = play_track(&token, &first.uri, prog).await;
+                                                }
+                                            }
+                                        });
+                                    }
+                                } else if let Some(tx) = &app_state.local_cmd_tx {
                                     let _ = tx.try_send(LocalPlayerCommand::Play);
                                 } else {
                                     tokio::spawn(async move { let _ = resume_playback(&token).await; });
                                 }
                             }
-                            app_state.player_state.as_mut().unwrap().is_playing = !is_playing;
+                            player.is_playing = !is_playing;
                         }
                     }
                     KeyCode::Left => { // Seek back 5s
@@ -970,8 +1238,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                             tokio::spawn(async move { let _ = seek_playback(&token, seek_ms).await; });
                         }
                     }
-                    KeyCode::Char('l') | KeyCode::Char('L') => { // Seek forward 15s
-                        if let Some(player) = &app_state.player_state {
+                    KeyCode::Char('l') | KeyCode::Char('L') => { 
+                        if app_state.fullscreen_player {
+                            app_state.lyrics_mode = match app_state.lyrics_mode {
+                                LyricsMode::Focused => LyricsMode::Full,
+                                LyricsMode::Full => LyricsMode::Focused,
+                            };
+                        } else if let Some(player) = &app_state.player_state {
                             let token = app_state.access_token.clone();
                             let seek_ms = std::cmp::min(player.progress_ms + 15000, player.duration_ms);
                             app_state.player_state.as_mut().unwrap().progress_ms = seek_ms;
@@ -1190,6 +1463,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                                 // Optimistic instant feedback
                                                 let current_vol = app_state.player_state.as_ref().map(|p| p.volume_percent).unwrap_or(50);
                                                 app_state.player_state = Some(PlayerState {
+                                                    track_uri: Some(uri.clone()),
                                                     track_name: track.name.clone(),
                                                     artist: track.artist.clone(),
                                                     progress_ms: 0,
@@ -1198,11 +1472,13 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                                     volume_percent: current_vol,
                                                     album_art_url: None,
                                                     is_buffering: true,
+                                                    is_fresh_cache: false,
+                                                    lyrics: None,
                                                 });
                                                 app_state.last_action_timestamp = get_current_unix_time();
 
                                                 tokio::spawn(async move {
-                                                    let _ = play_track(&token, &uri).await;
+                                                    let _ = play_track(&token, &uri, 0).await;
                                                 });
                                             }
                                         }
@@ -1222,8 +1498,10 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                         let tx = tx.clone();
                                         let q = query.clone();
                                         tokio::spawn(async move {
-                                            let results = search_spotify_api(&token, &q).await;
-                                            let _ = tx.send(AppMessage::SearchResults(results));
+                                            match search_spotify_api(&token, &q).await {
+                                                Ok(results) => { let _ = tx.send(AppMessage::SearchResults(results)); }
+                                                Err(e) => { let _ = tx.send(AppMessage::SearchError(e)); }
+                                            }
                                         });
                                     } else {
                                         *is_typing = false;
@@ -1289,6 +1567,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                                 if !uri.is_empty() {
                                                     let current_vol = app_state.player_state.as_ref().map(|p| p.volume_percent).unwrap_or(50);
                                                     app_state.player_state = Some(PlayerState {
+                                                        track_uri: Some(uri.clone()),
                                                         track_name: track.name.clone(),
                                                         artist: track.artist.clone(),
                                                         progress_ms: 0,
@@ -1297,13 +1576,28 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                                         volume_percent: current_vol,
                                                         album_art_url: None,
                                                         is_buffering: true,
+                                                        is_fresh_cache: false,
+                                                        lyrics: None,
                                                     });
                                                     app_state.last_action_timestamp = get_current_unix_time();
-                                                    tokio::spawn(async move { let _ = play_track(&token, &uri).await; });
+                                                    tokio::spawn(async move { let _ = play_track(&token, &uri, 0).await; });
                                                 }
                                             }
                                         }
                                     }
+                                }
+
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Char('i') => {
+                                    app_state.fullscreen_player = !app_state.fullscreen_player;
+                                }
+                                KeyCode::Char('c') => {
+                                    app_state.player_state = None;
+                                    app_state.current_art_protocol = None;
+                                    app_state.current_art_bytes = None;
+                                    app_state.current_art_url = None;
+                                    app_state.app_cache.last_player = None;
+                                    save_cache(&app_state.app_cache);
                                 }
                                 _ => {}
                             }
@@ -1340,12 +1634,23 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                                         let token = app_state.access_token.clone();
                                         let tx = tx.clone();
                                         tokio::spawn(async move {
-                                            if let Ok(_) = add_track_to_playlist_api(&token, &target_list, &uri).await {
-                                                let _ = tx.send(AppMessage::TrackAddedToPlaylist);
-                                            }
+                                            let _ = add_track_to_playlist_api(&token, &target_list, &uri).await;
+                                            let _ = tx.send(AppMessage::TrackAddedToPlaylist(target_list));
                                         });
                                     }
                                 }
+                            }
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('i') => {
+                                app_state.fullscreen_player = !app_state.fullscreen_player;
+                            }
+                            KeyCode::Char('c') => {
+                                app_state.player_state = None;
+                                app_state.current_art_protocol = None;
+                                app_state.current_art_bytes = None;
+                                app_state.current_art_url = None;
+                                app_state.app_cache.last_player = None;
+                                save_cache(&app_state.app_cache);
                             }
                             _ => {}
                         }
@@ -1526,6 +1831,22 @@ fn ui(f: &mut Frame, state: &mut AppState) {
     f.render_widget(player_block, chunks[pdx]);
     
     if let Some(player) = &state.player_state {
+        let has_lyrics = if let Some(lyrics) = &player.lyrics {
+            lyrics.synced.is_some() || lyrics.plain.is_some()
+        } else {
+            false
+        };
+
+        let (player_area, lyrics_area) = if state.fullscreen_player && has_lyrics {
+            let v_split = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(inner_area);
+            (v_split[0], Some(v_split[1]))
+        } else {
+            (inner_area, None)
+        };
+
         let h_split_constraints = if state.fullscreen_player {
             vec![Constraint::Percentage(50), Constraint::Percentage(50)]
         } else {
@@ -1535,7 +1856,7 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(h_split_constraints)
-            .split(inner_area);
+            .split(player_area);
         let sub_chunks = split.to_vec();
         
         if let Some(protocol) = state.current_art_protocol.as_mut() {
@@ -1607,9 +1928,20 @@ fn ui(f: &mut Frame, state: &mut AppState) {
             .constraints([Constraint::Min(0), Constraint::Length(20)])
             .split(detail_chunks[5]);
             
-        let left_status = Paragraph::new(format!("{}   {} / {}", 
-            status, format_duration(player.progress_ms), format_duration(player.duration_ms)))
-            .style(Style::default().fg(Color::Gray));
+        let mut status_str = format!("{}   {} / {}", 
+            status, format_duration(player.progress_ms), format_duration(player.duration_ms));
+            
+        if state.fullscreen_player && !has_lyrics {
+            if player.lyrics.is_none() {
+                let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let idx = (state.player_spinner_tick as usize) % spinners.len();
+                status_str.push_str(&format!("  |  Fetching lyrics... {}", spinners[idx]));
+            } else {
+                status_str.push_str("  |  No lyrics found");
+            }
+        }
+            
+        let left_status = Paragraph::new(status_str).style(Style::default().fg(Color::Gray));
             
         let right_status = Paragraph::new(format!("VOL {} {:3}%", vol_bar, player.volume_percent))
             .style(Style::default().fg(Color::Gray))
@@ -1629,6 +1961,113 @@ fn ui(f: &mut Frame, state: &mut AppState) {
         f.render_widget(gauge, detail_chunks[4]);
         f.render_widget(left_status, status_split[0]);
         f.render_widget(right_status, status_split[1]);
+        
+        if state.fullscreen_player && has_lyrics {
+            let lyrics_chunk = lyrics_area.unwrap();
+            let lyrics_block = Block::default()
+                .borders(Borders::NONE)
+                .padding(ratatui::widgets::Padding::new(0, 0, 1, 0));
+                
+            let inner_lyrics_area = lyrics_block.inner(lyrics_chunk);
+            f.render_widget(lyrics_block, lyrics_chunk);
+            
+            if let Some(lyrics) = &player.lyrics {
+                if let Some(synced) = &lyrics.synced {
+                    let mut active_idx = 0;
+                    for (i, line) in synced.iter().enumerate() {
+                        if player.progress_ms >= line.time_ms {
+                            active_idx = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    
+                    let mut lyric_spans = Vec::new();
+                    
+                    if state.lyrics_mode == LyricsMode::Focused {
+                        let pad_top = inner_lyrics_area.height.saturating_sub(5) / 2;
+                        for _ in 0..pad_top {
+                            lyric_spans.push(Line::from(vec![Span::raw(" ")]));
+                        }
+                        
+                        let prev_idx2 = active_idx.saturating_sub(2);
+                        if prev_idx2 < active_idx && active_idx >= 2 {
+                            let text = &synced[prev_idx2].text;
+                            lyric_spans.push(Line::from(vec![Span::styled(if text.is_empty() { " " } else { text } .to_string(), Style::default().fg(Color::DarkGray))]));
+                        }
+                        
+                        let prev_idx = active_idx.saturating_sub(1);
+                        if prev_idx < active_idx && active_idx >= 1 {
+                            let text = &synced[prev_idx].text;
+                            lyric_spans.push(Line::from(vec![Span::styled(if text.is_empty() { " " } else { text } .to_string(), Style::default().fg(Color::Gray))]));
+                        }
+                        
+                        let text = &synced[active_idx].text;
+                        lyric_spans.push(Line::from(vec![Span::styled(if text.is_empty() { " " } else { text } .to_string(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD))]));
+                        
+                        let next_idx = active_idx.saturating_add(1);
+                        if next_idx < synced.len() {
+                            let text = &synced[next_idx].text;
+                            lyric_spans.push(Line::from(vec![Span::styled(if text.is_empty() { " " } else { text } .to_string(), Style::default().fg(Color::Gray))]));
+                        }
+                        
+                        let next_idx2 = active_idx.saturating_add(2);
+                        if next_idx2 < synced.len() {
+                            let text = &synced[next_idx2].text;
+                            lyric_spans.push(Line::from(vec![Span::styled(if text.is_empty() { " " } else { text } .to_string(), Style::default().fg(Color::DarkGray))]));
+                        }
+                    } else {
+                        let visible_lines = inner_lyrics_area.height as usize;
+                        let max_scroll = synced.len().saturating_sub(visible_lines);
+                        let start_idx = state.lyrics_scroll_offset.min(max_scroll);
+                        
+                        for i in start_idx..(start_idx + visible_lines).min(synced.len()) {
+                            let text = &synced[i].text;
+                            if text.is_empty() {
+                                lyric_spans.push(Line::from(vec![Span::raw(" ")]));
+                                continue;
+                            }
+                            if i == active_idx {
+                                lyric_spans.push(Line::from(vec![Span::styled(text.clone(), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD).add_modifier(Modifier::UNDERLINED))]));
+                            } else {
+                                lyric_spans.push(Line::from(vec![Span::styled(text.clone(), Style::default().fg(Color::Gray))]));
+                            }
+                        }
+                    }
+                    
+                    let p = Paragraph::new(lyric_spans).alignment(ratatui::layout::Alignment::Center);
+                    f.render_widget(p, inner_lyrics_area);
+                } else if let Some(plain) = &lyrics.plain {
+                    let text_lines: Vec<&str> = plain.lines().collect();
+                    let visible_lines = inner_lyrics_area.height as usize;
+                    let max_scroll = text_lines.len().saturating_sub(visible_lines);
+                    let start_idx = state.lyrics_scroll_offset.min(max_scroll);
+                    
+                    let mut lyric_spans = Vec::new();
+                    for i in start_idx..(start_idx + visible_lines).min(text_lines.len()) {
+                        lyric_spans.push(Line::from(vec![Span::styled(text_lines[i].to_string(), Style::default().fg(Color::Gray))]));
+                    }
+                    
+                    let p = Paragraph::new(lyric_spans)
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(ratatui::widgets::Wrap { trim: false });
+                    f.render_widget(p, inner_lyrics_area);
+                } else {
+                    let p = Paragraph::new("Lyrics not physically found on LRCLIB.")
+                        .style(Style::default().fg(Color::DarkGray))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    f.render_widget(p, inner_lyrics_area);
+                }
+            } else {
+                let spinners = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+                let idx = (state.player_spinner_tick as usize) % spinners.len();
+                let txt = format!("Fetching lyrics... {}", spinners[idx]);
+                let p = Paragraph::new(txt)
+                    .style(Style::default().fg(Color::DarkGray))
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, inner_lyrics_area);
+            }
+        }
     } else {
         let text = Paragraph::new("\n  No track currently playing. Select a track and press Enter to begin playback.")
             .style(Style::default().fg(Color::DarkGray));
