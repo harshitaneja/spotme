@@ -832,3 +832,51 @@ fn jump_search_next(tracks: &[Track], state: &mut ListState, query: &str, forwar
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::state::tests::mock_app_state;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, KeyEventKind, KeyEventState};
+
+    fn make_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: KeyEventState::empty(),
+        }
+    }
+
+    #[test]
+    fn test_handle_quit_event() {
+        let mut state = mock_app_state();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        let key = make_key(KeyCode::Char('q'));
+        let result = handle_key_events(key, &mut state, &tx).unwrap();
+        assert_eq!(result, true); // True means exit loop
+    }
+
+    #[test]
+    fn test_search_transition() {
+        let mut state = mock_app_state();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        
+        // Assert initial
+        assert!(matches!(state.current_view, View::Playlists));
+        
+        let key = make_key(KeyCode::Char('s'));
+        let result = handle_key_events(key, &mut state, &tx).unwrap();
+        assert_eq!(result, false);
+
+        match state.current_view {
+            View::SearchGlobal { ref query, is_typing, .. } => {
+                assert!(is_typing);
+                assert!(query.is_empty());
+            }
+            _ => panic!("Expected SearchGlobal view"),
+        }
+        assert!(state.show_popup);
+    }
+}

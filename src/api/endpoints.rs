@@ -25,7 +25,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 
             let client = crate::api::get_client();
             let res = client
-                .post("https://accounts.spotify.com/api/token")
+                .post(&format!("{}/api/token", crate::api::accounts_base_url()))
                 .form(&[
                     ("grant_type", "refresh_token"),
                     ("refresh_token", &cache.refresh_token),
@@ -80,7 +80,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
     let mut rng = rand::rng();
     let mut verifier_bytes = [0u8; 32];
     rng.fill(&mut verifier_bytes);
-    let code_verifier = URL_SAFE_NO_PAD.encode(&verifier_bytes);
+    let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
     // Generate Code Challenge
     let mut hasher = Sha256::new();
@@ -91,8 +91,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
     let enc_redirect = urlencoding::encode(redirect_uri);
     let enc_scopes = urlencoding::encode(scopes);
 
-    let auth_url = format!(
-        "https://accounts.spotify.com/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&show_dialog=true",
+    let auth_url = format!("{}/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge_method=S256&code_challenge={}&show_dialog=true", crate::api::accounts_base_url(),
         client_id, enc_redirect, enc_scopes, code_challenge
     );
 
@@ -115,9 +114,10 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
         .parse::<u16>()
         .unwrap_or(crate::config::DEFAULT_PORT);
 
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_u16))
-        .await
-        .unwrap_or_else(|_| panic!("Failed to bind port {}", port_u16));
+    let listener = match tokio::net::TcpListener::bind(format!("127.0.0.1:{}", port_u16)).await {
+        Ok(l) => l,
+        Err(e) => return Err(anyhow::anyhow!("Failed to bind port {}: {}", port_u16, e)),
+    };
     println!("Waiting up to 120 seconds for browser authentication... (Press Ctrl+C to cancel)");
 
     let code = tokio::select! {
@@ -155,7 +155,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 
     let client = crate::api::get_client();
     let response = client
-        .post("https://accounts.spotify.com/api/token")
+        .post(&format!("{}/api/token", crate::api::accounts_base_url()))
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.as_str()),
@@ -205,7 +205,7 @@ pub async fn get_or_refresh_token(client_id: &str, redirect_uri: &str) -> Result
 pub async fn fetch_user_profile(token: &str) -> Result<(String, String)> {
     let client = crate::api::get_client();
     let res = client
-        .get("https://api.spotify.com/v1/me")
+        .get(&format!("{}/v1/me", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -283,7 +283,7 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
     let mut device_id = None;
     for _ in 0..5 {
         if let Ok(res) = client
-            .get("https://api.spotify.com/v1/me/player/devices")
+            .get(&format!("{}/v1/me/player/devices", crate::api::api_base_url()))
             .bearer_auth(token)
             .send()
             .await
@@ -307,7 +307,7 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
         tokio::time::sleep(tokio::time::Duration::from_millis(600)).await;
     }
 
-    let mut url = "https://api.spotify.com/v1/me/player/play".to_string();
+    let mut url = format!("{}/v1/me/player/play", crate::api::api_base_url());
     if let Some(id) = device_id {
         url = format!("{}?device_id={}", url, id);
     }
@@ -337,7 +337,7 @@ pub async fn play_track(token: &str, uri: &str, position_ms: u64) -> Result<(), 
 pub async fn pause_playback(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .put("https://api.spotify.com/v1/me/player/pause")
+        .put(&format!("{}/v1/me/player/pause", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -347,7 +347,7 @@ pub async fn pause_playback(token: &str) -> Result<(), anyhow::Error> {
 pub async fn resume_playback(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .put("https://api.spotify.com/v1/me/player/play")
+        .put(&format!("{}/v1/me/player/play", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -356,8 +356,7 @@ pub async fn resume_playback(token: &str) -> Result<(), anyhow::Error> {
 
 pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
-    let url = format!(
-        "https://api.spotify.com/v1/me/player/seek?position_ms={}",
+    let url = format!("{}/v1/me/player/seek?position_ms={}", crate::api::api_base_url(),
         position_ms
     );
     client.put(&url).bearer_auth(token).send().await?;
@@ -367,7 +366,7 @@ pub async fn seek_playback(token: &str, position_ms: u64) -> Result<(), anyhow::
 pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .post("https://api.spotify.com/v1/me/player/next")
+        .post(&format!("{}/v1/me/player/next", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -377,7 +376,7 @@ pub async fn next_track(token: &str) -> Result<(), anyhow::Error> {
 pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
     let client = crate::api::get_client();
     client
-        .post("https://api.spotify.com/v1/me/player/previous")
+        .post(&format!("{}/v1/me/player/previous", crate::api::api_base_url()))
         .bearer_auth(token)
         .send()
         .await?;
@@ -387,7 +386,7 @@ pub async fn previous_track(token: &str) -> Result<(), anyhow::Error> {
 // Track Fetch Hook
 pub async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
     let client = crate::api::get_client();
-    let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
+    let mut url = format!("{}/v1/me/playlists?limit=50", crate::api::api_base_url());
     let mut out = Vec::new();
 
     while let Ok(res) = client.get(&url).bearer_auth(token).send().await {
@@ -423,8 +422,7 @@ pub async fn fetch_playlists_api(token: &str) -> Vec<Playlist> {
 
 pub async fn fetch_tracks(token: String, playlist_id: String) -> Result<Vec<Track>, anyhow::Error> {
     let client = crate::api::get_client();
-    let mut url = format!(
-        "https://api.spotify.com/v1/playlists/{}/items?market=from_token",
+    let mut url = format!("{}/v1/playlists/{}/items?market=from_token", crate::api::api_base_url(),
         playlist_id
     );
     let mut tracks = Vec::new();
@@ -483,8 +481,7 @@ pub async fn search_spotify_api(token: &str, query: &str) -> Result<Vec<Track>, 
     let safe_query = urlencoding::encode(query.trim());
 
     // Spotify natively defaults to 20 limit. Leaving it omitted bypasses the 400 Bad Request parameter fault.
-    let url = format!(
-        "https://api.spotify.com/v1/search?q={}&type=track",
+    let url = format!("{}/v1/search?q={}&type=track", crate::api::api_base_url(),
         safe_query
     );
 
@@ -545,7 +542,7 @@ pub async fn add_track_to_playlist_api(
     let client = crate::api::get_client();
     let payload = serde_json::json!({ "uris": [track_uri] });
 
-    let url = format!("https://api.spotify.com/v1/playlists/{}/items", playlist_id);
+    let url = format!("{}/v1/playlists/{}/items", crate::api::api_base_url(), playlist_id);
     app_log(&format!("ADD TRACK INIT: POST {}", url));
     app_log(&format!("ADD TRACK PAYLOAD: {}", payload));
 
@@ -571,7 +568,7 @@ pub async fn add_track_to_playlist_api(
 
 pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
     let client = crate::api::get_client();
-    let url = "https://api.spotify.com/v1/me/player/queue";
+    let url = format!("{}/v1/me/player/queue", crate::api::api_base_url());
     app_log(&format!("NETWORK INIT: GET {}", url));
     let res = client
         .get(url)
@@ -610,7 +607,7 @@ pub async fn fetch_player_queue(token: &str) -> Result<Vec<Track>, String> {
 
 pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track>, String> {
     let client = crate::api::get_client();
-    let url = format!("https://api.spotify.com/v1/albums/{}", album_id);
+    let url = format!("{}/v1/albums/{}", crate::api::api_base_url(), album_id);
     let res = client
         .get(&url)
         .bearer_auth(token)
@@ -640,7 +637,7 @@ pub async fn fetch_album_tracks(token: &str, album_id: &str) -> Result<Vec<Track
 
 pub async fn fetch_featured_playlists_api(token: &str) -> Vec<Playlist> {
     let client = crate::api::get_client();
-    let url = "https://api.spotify.com/v1/browse/featured-playlists?limit=50";
+    let url = format!("{}/v1/browse/featured-playlists?limit=50", crate::api::api_base_url());
     if let Ok(res) = client.get(url).bearer_auth(token).send().await {
         if res.status().is_success() {
             if let Ok(json) = res.json::<serde_json::Value>().await {
@@ -768,12 +765,48 @@ pub async fn set_volume(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = crate::api::get_client();
     client
-        .put(format!(
-            "https://api.spotify.com/v1/me/player/volume?volume_percent={}",
+        .put(format!("{}/v1/me/player/volume?volume_percent={}", crate::api::api_base_url(),
             percent
         ))
         .bearer_auth(token)
         .send()
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mockito::Server;
+
+    #[tokio::test]
+    async fn test_api_endpoints_mocked() {
+        let mut server = Server::new_async().await;
+        
+        let mock_profile = server.mock("GET", "/v1/me")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"display_name": "Mock User", "id": "mock_id"}"#)
+            .create_async()
+            .await;
+
+        let mock_pause = server.mock("PUT", "/v1/me/player/pause")
+            .match_header("authorization", "Bearer test_token")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        std::env::set_var("SPOTIFY_API_BASE_URL", server.url());
+
+        let profile_res = fetch_user_profile("test_token").await.unwrap();
+        assert_eq!(profile_res.0, "Mock User");
+        assert_eq!(profile_res.1, "mock_id");
+
+        let pause_res = pause_playback("test_token").await;
+        assert!(pause_res.is_ok());
+
+        mock_profile.assert_async().await;
+        mock_pause.assert_async().await;
+    }
 }

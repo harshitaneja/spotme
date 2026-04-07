@@ -48,7 +48,7 @@ fn save_cache(cache: &AppCache) {
 pub fn get_current_unix_time() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or(std::time::Duration::default())
+        .unwrap_or_default()
         .as_secs()
 }
 
@@ -231,7 +231,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
                         is_searching: false,
                     };
                 }
-                AppMessage::UpdatePlayerState(mut pstate) => {
+                AppMessage::UpdatePlayerState(pstate) => {
                     let now = get_current_unix_time();
                     if pstate.is_none() {
                         if app_state
@@ -643,4 +643,21 @@ pub async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_duration() {
+        assert_eq!(format_duration(0), "0:00");
+        assert_eq!(format_duration(999), "0:00");
+        assert_eq!(format_duration(1000), "0:01");
+        assert_eq!(format_duration(59000), "0:59");
+        assert_eq!(format_duration(60000), "1:00");
+        assert_eq!(format_duration(61000), "1:01");
+        assert_eq!(format_duration(3599000), "59:59");
+        assert_eq!(format_duration(3600000), "60:00");
+    }
 }

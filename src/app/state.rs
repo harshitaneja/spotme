@@ -145,6 +145,114 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+
+    pub fn mock_app_state() -> AppState {
+        AppState {
+            display_name: "TestUser".to_string(),
+            user_id: "test_id".to_string(),
+            show_others: false,
+            app_cache: AppCache::default(),
+            filtered_playlists: vec![],
+            playlist_state: ListState::default(),
+            current_view: View::Playlists,
+            access_token: "".to_string(),
+            player_state: None,
+            current_art_url: None,
+            current_art_bytes: None,
+            current_art_protocol: None,
+            player_spinner_tick: 0,
+            picker: Picker::halfblocks(),
+            fullscreen_player: false,
+            lyrics_mode: LyricsMode::Focused,
+            lyrics_scroll_offset: 0,
+            dominant_color: None,
+            show_help: false,
+            show_popup: false,
+            local_cmd_tx: None,
+            last_action_timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn test_merge_player_state_debounce() {
+        let mut state = mock_app_state();
+        state.last_action_timestamp = 100;
+        
+        state.player_state = Some(PlayerState {
+            track_uri: None,
+            track_name: "Original".to_string(),
+            artist: "".to_string(),
+            progress_ms: 1000,
+            duration_ms: 5000,
+            is_playing: true,
+            volume_percent: 50,
+            album_art_url: None,
+            is_buffering: false,
+            is_fresh_cache: false,
+            lyrics: None,
+        });
+
+        // 1. Debounce Active, Different Track -> Should Drop
+        let incoming = Some(PlayerState {
+            track_uri: None,
+            track_name: "Different".to_string(),
+            artist: "".to_string(),
+            progress_ms: 2000,
+            duration_ms: 5000,
+            is_playing: true,
+            volume_percent: 50,
+            album_art_url: None,
+            is_buffering: false,
+            is_fresh_cache: false,
+            lyrics: None,
+        });
+        state.merge_incoming_player_state(incoming.clone(), 101); // 101 - 100 < 3 -> debounce active
+        assert_eq!(state.player_state.as_ref().unwrap().track_name, "Original");
+
+        // 2. Debounce Active, Same Track -> Should merge playing status but keep local overriding state
+        let incoming_same = Some(PlayerState {
+            track_uri: None,
+            track_name: "Original".to_string(),
+            artist: "".to_string(),
+            progress_ms: 2000,
+            duration_ms: 5000,
+            is_playing: false,
+            volume_percent: 100,
+            album_art_url: None,
+            is_buffering: true,
+            is_fresh_cache: false,
+            lyrics: None,
+        });
+        state.merge_incoming_player_state(incoming_same, 101);
+        let merged = state.player_state.as_ref().unwrap();
+        assert_eq!(merged.is_playing, true); // Kept from local
+        assert_eq!(merged.volume_percent, 50); // Kept from local
+        assert_eq!(merged.progress_ms, 1000); // Kept from local
+
+        // 3. Debounce Inactive -> Overwrites completely
+        let incoming_new = Some(PlayerState {
+            track_uri: None,
+            track_name: "Different".to_string(),
+            artist: "".to_string(),
+            progress_ms: 2000,
+            duration_ms: 5000,
+            is_playing: false,
+            volume_percent: 100,
+            album_art_url: None,
+            is_buffering: false,
+            is_fresh_cache: false,
+            lyrics: None,
+        });
+        state.merge_incoming_player_state(incoming_new.clone(), 105); // 105 - 100 >= 3 -> debounce inactive
+        let final_state = state.player_state.as_ref().unwrap();
+        assert_eq!(final_state.track_name, "Different");
+        assert_eq!(final_state.volume_percent, 100);
+    }
+}
+
 // Async Message passing
 pub enum AppMessage {
     TracksFetched {

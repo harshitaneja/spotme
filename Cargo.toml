@@ -30,6 +30,9 @@ sha2 = "0.11.0"
 name = "spotme"
 path = "src/main.rs"
 
+[dev-dependencies]
+mockito = "1.7.2"
+
 
 
 
