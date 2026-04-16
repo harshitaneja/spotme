@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 pub enum LocalPlayerCommand {
     Play,
     Pause,
+    SetVolume(u8),
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -108,6 +109,7 @@ pub struct AppState {
     pub last_action_timestamp: u64,
     pub client_id: String,
     pub status_message: Option<(String, u64)>, // (message, timestamp)
+    pub user_config: crate::config::UserConfig,
 }
 
 impl AppState {
@@ -201,6 +203,7 @@ pub mod tests {
             last_action_timestamp: 0,
             client_id: String::new(),
             status_message: None,
+            user_config: crate::config::UserConfig::default(),
         }
     }
 

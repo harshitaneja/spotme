@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const AUTH_TIMEOUT_SECS: u64 = 120;
@@ -7,9 +8,76 @@ pub const SEEK_SHORT_MS: u64 = 5000;
 pub const SEEK_LONG_MS: u64 = 15000;
 pub const VOLUME_STEP: u8 = 5;
 
+/// Persistent user configuration saved as TOML.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct UserConfig {
+    #[serde(default = "default_volume")]
+    pub volume: u8,
+    #[serde(default = "default_volume_step")]
+    pub volume_step: u8,
+    #[serde(default)]
+    pub fullscreen_on_start: bool,
+}
+
+fn default_volume() -> u8 {
+    50
+}
+fn default_volume_step() -> u8 {
+    VOLUME_STEP
+}
+
+impl Default for UserConfig {
+    fn default() -> Self {
+        Self {
+            volume: default_volume(),
+            volume_step: default_volume_step(),
+            fullscreen_on_start: false,
+        }
+    }
+}
+
+impl UserConfig {
+    pub fn load() -> Self {
+        let path = &paths().config_file;
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(cfg) = toml::from_str(&content) {
+                return cfg;
+            }
+        }
+        let cfg = Self::default();
+        cfg.save();
+        cfg
+    }
+
+    pub fn save(&self) {
+        let path = &paths().config_file;
+        if let Ok(content) = toml::to_string_pretty(self) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(path)
+                {
+                    use std::io::Write;
+                    let _ = file.write_all(content.as_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::write(path, content);
+            }
+        }
+    }
+}
+
 pub struct AppPaths {
     pub cache_file: PathBuf,
     pub token_cache_file: PathBuf,
+    pub config_file: PathBuf,
     pub log_file: PathBuf,
     pub env_file: PathBuf,
 }
@@ -42,6 +110,7 @@ impl AppPaths {
         Self {
             cache_file: cache_dir.join("spotme_cache.json"),
             token_cache_file: cache_dir.join("spotify_token_cache.json"),
+            config_file: config_dir.join("config.toml"),
             log_file: data_dir.join("spotme.log"),
             env_file: config_dir.join(".env"),
         }

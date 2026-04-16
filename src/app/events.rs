@@ -243,37 +243,48 @@ pub fn handle_key_events(
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 if let Some(player) = &app_state.player_state {
-                    let token = app_state.access_token.clone();
-                    let vol =
-                        std::cmp::min(player.volume_percent + crate::config::VOLUME_STEP, 100);
+                    let step = app_state.user_config.volume_step;
+                    let vol = std::cmp::min(player.volume_percent + step, 100);
                     if let Some(ref mut ps) = app_state.player_state {
                         ps.volume_percent = vol;
                     }
-                    let err_tx = tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = set_volume(&token, vol).await {
-                            let _ = err_tx
-                                .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
-                        }
-                    });
+                    app_state.user_config.volume = vol;
+                    app_state.user_config.save();
+                    if let Some(cmd_tx) = &app_state.local_cmd_tx {
+                        let _ = cmd_tx.try_send(LocalPlayerCommand::SetVolume(vol));
+                    } else {
+                        let token = app_state.access_token.clone();
+                        let err_tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = set_volume(&token, vol).await {
+                                let _ = err_tx
+                                    .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
+                            }
+                        });
+                    }
                 }
             }
             KeyCode::Char('-') | KeyCode::Char('_') => {
                 if let Some(player) = &app_state.player_state {
-                    let token = app_state.access_token.clone();
-                    let vol = player
-                        .volume_percent
-                        .saturating_sub(crate::config::VOLUME_STEP);
+                    let step = app_state.user_config.volume_step;
+                    let vol = player.volume_percent.saturating_sub(step);
                     if let Some(ref mut ps) = app_state.player_state {
                         ps.volume_percent = vol;
                     }
-                    let err_tx = tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = set_volume(&token, vol).await {
-                            let _ = err_tx
-                                .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
-                        }
-                    });
+                    app_state.user_config.volume = vol;
+                    app_state.user_config.save();
+                    if let Some(cmd_tx) = &app_state.local_cmd_tx {
+                        let _ = cmd_tx.try_send(LocalPlayerCommand::SetVolume(vol));
+                    } else {
+                        let token = app_state.access_token.clone();
+                        let err_tx = tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = set_volume(&token, vol).await {
+                                let _ = err_tx
+                                    .send(AppMessage::StatusError(format!("Volume failed: {}", e)));
+                            }
+                        });
+                    }
                 }
             }
             KeyCode::Char('v') | KeyCode::Char('f') => {

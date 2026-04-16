@@ -332,6 +332,10 @@ pub async fn start_librespot_daemon(
             LocalPlayerCommand::Pause => {
                 let _ = spirc.pause();
             }
+            LocalPlayerCommand::SetVolume(percent) => {
+                let vol = (percent as u16).min(100) * (u16::MAX / 100);
+                let _ = spirc.set_volume(vol);
+            }
         }
     }
 

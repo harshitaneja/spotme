@@ -5,6 +5,7 @@ use crate::api::endpoints::*;
 use crate::api::models::*;
 use crate::app::state::*;
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{self, Event},
     execute,
@@ -20,6 +21,31 @@ use ratatui::{
 use ratatui_image::picker::Picker;
 use std::{env, io, time::Duration};
 use tokio::sync::mpsc;
+
+#[derive(Parser)]
+#[command(
+    name = "spotme",
+    about = "A terminal-based Spotify client with album art, lyrics, and local playback",
+    version,
+    author
+)]
+struct Cli {
+    /// Print config file path and exit
+    #[arg(long)]
+    config_path: bool,
+
+    /// Print cache directory path and exit
+    #[arg(long)]
+    cache_path: bool,
+
+    /// Reset config to defaults
+    #[arg(long)]
+    reset_config: bool,
+
+    /// Set initial volume (0-100)
+    #[arg(long, value_name = "0-100")]
+    volume: Option<u8>,
+}
 
 // Models extracted to src/api/models.rs
 
@@ -669,6 +695,31 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app_state: AppState
 
 #[tokio::main]
 pub async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Handle informational flags that exit early
+    if cli.config_path {
+        println!("{}", config::paths().config_file.display());
+        return Ok(());
+    }
+    if cli.cache_path {
+        println!("{}", config::paths().cache_file.parent().unwrap_or_else(|| std::path::Path::new(".")).display());
+        return Ok(());
+    }
+    if cli.reset_config {
+        let cfg = config::UserConfig::default();
+        cfg.save();
+        println!("Config reset to defaults at {}", config::paths().config_file.display());
+        return Ok(());
+    }
+
+    let mut user_config = config::UserConfig::load();
+
+    // CLI --volume overrides saved config
+    if let Some(v) = cli.volume {
+        user_config.volume = v.min(100);
+    }
+
     init_logger();
     dotenv().ok();
     dotenvy::from_path(&crate::config::paths().env_file).ok();
@@ -736,7 +787,7 @@ pub async fn main() -> Result<()> {
         progress_ms: cached.progress_ms,
         duration_ms: cached.duration_ms,
         is_playing: false,
-        volume_percent: 50,
+        volume_percent: user_config.volume,
         album_art_url: cached.album_art_url.clone(),
         is_buffering: false,
         is_fresh_cache: true,
@@ -758,7 +809,7 @@ pub async fn main() -> Result<()> {
         current_art_protocol: None,
         player_spinner_tick: 0,
         picker,
-        fullscreen_player: false,
+        fullscreen_player: user_config.fullscreen_on_start,
         lyrics_mode: LyricsMode::Focused,
         lyrics_scroll_offset: 0,
         dominant_color: None,
@@ -768,6 +819,7 @@ pub async fn main() -> Result<()> {
         last_action_timestamp: 0,
         client_id,
         status_message: None,
+        user_config,
     };
 
     // TUI setup

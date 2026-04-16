@@ -1,0 +1,11 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack in `rsa`
+    # Risk factor: Extremely Low.
+    # Justification: The Marvin Attack allows key recovery via timing side channels
+    # when processing millions of crafted interactions. SpotMe acts as a client,
+    # and does not operate as an internet-facing TLS server processing incoming
+    # handshakes. Until an upstream patch is available, we acknowledge and accept
+    # this risk as it poses no practical threat to local client operation.
+    "RUSTSEC-2023-0071"
+]

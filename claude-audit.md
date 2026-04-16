@@ -1,198 +1,366 @@
-# SpotMe Security & Code Audit
+# SpotMe Enterprise Security & Architecture Audit
 
 **Date**: 2026-04-08  
-**Scope**: Full codebase review (~3,650 LOC Rust), dependency audit, CI/CD review  
-**Tools**: Manual code review, `cargo clippy`, `cargo test`, `cargo audit`
+**Auditor**: Claude Opus 4.6  
+**Scope**: Full source review (~4,200 LOC Rust), dependency chain, CI/CD, secrets management, runtime behavior  
+**Tools**: Manual line-by-line review, `cargo clippy`, `cargo test`, `cargo audit`, static analysis  
+**Standard**: Enterprise production readiness — zero tolerance
 
 ---
 
-## Summary
+## Executive Summary
+
+SpotMe is a well-structured Rust TUI Spotify client with PKCE OAuth, local playback via librespot, and synchronized lyrics. Prior audit rounds have addressed the most severe issues. However, the codebase still exhibits **28 findings** across security, reliability, architecture, and operational concerns that would block enterprise certification.
 
 | Severity | Count |
 |----------|-------|
-| Critical | 1     |
-| High     | 4     |
-| Medium   | 5     |
-| Low      | 4     |
-
-**Tests**: 9/9 passing  
-**Clippy**: Clean (0 warnings)  
-**Dependency vulns**: 1 vulnerability, 2 warnings
+| Critical | 2     |
+| High     | 5     |
+| Medium   | 10    |
+| Low      | 11    |
 
 ---
 
 ## Critical
 
-### C1. Access token stored in plaintext in `AppState` and cloned freely
+### CR-1. Client secret committed to repository in plaintext
 
-**Location**: `state.rs:93`, `main.rs:110`, `events.rs` (throughout)
+**Location**: `.env:2`
 
-The Spotify access token is stored as a plain `String` in `AppState` and cloned into dozens of fire-and-forget `tokio::spawn` closures. Any panic or core dump would expose the token. The token is also passed by value into long-lived background pollers (`main.rs:110`) that never refresh it — after ~1 hour the token expires and the poller silently fails.
+```
+SPOTIFY_CLIENT_SECRET="5df5c5e058d1467cbe8fcd4625180476"
+```
 
-**Recommendation**: Wrap the token in `Arc<RwLock<String>>` so it can be refreshed in-place, and avoid scattering copies across spawned tasks.
+A live Spotify client secret is committed to the repository. While `.env` is in `.gitignore`, the file exists in the working directory and the secret value `5df5c5e058d1467cbe8fcd4625180476` is a real credential. Furthermore, the code ships a hardcoded fallback `client_id` at `main.rs:680` (`db41158aa95448d6914e73975652b52a`) which is embedded directly in the binary.
+
+**Impact**: Any user with repo access obtains the client secret. The hardcoded client_id means the binary itself contains a credential. If this is a shared/public app registration, abuse could trigger Spotify's rate limits for all users.
+
+**Recommendation**: Remove the client secret from `.env` entirely (PKCE flow doesn't need it). Rotate the Spotify app credentials immediately. Move the default client_id to a config file or require it as an env var — do not embed credentials in compiled binaries.
+
+### CR-2. Token cache and app cache contain secrets in plaintext JSON on disk
+
+**Location**: `endpoints.rs:42-62` (token cache), `main.rs:41-62` (app cache)
+
+`SpotifyTokenCache` stores `access_token` and `refresh_token` as plaintext JSON. While file permissions are set to `0o600`, this provides no protection against:
+- Process memory dumps
+- Backup software that copies the file
+- The file is unencrypted — any process running as the same user can read it
+- On macOS, Spotlight/Time Machine may index/backup the cache directory
+- On non-Unix platforms (`#[cfg(not(unix))]`), no permissions are set at all — the file is world-readable by default
+
+**Recommendation**: Use platform-specific secret storage (macOS Keychain via `security-framework`, Linux `libsecret`, Windows Credential Manager). At minimum, encrypt the token cache with a key derived from the machine ID.
 
 ---
 
 ## High
 
-### H1. Background poller never refreshes expired token
+### H-1. `save_cache()` performs synchronous file I/O on the tokio executor
 
-**Location**: `main.rs:110-179`
+**Location**: `main.rs:41-62`
 
-The player-state polling loop clones `access_token` once at startup and uses it forever. After the token's 1-hour TTL expires, every poll silently returns 401 and the player state goes stale with no user-visible indication.
+`save_cache()` is called from within the `run_app` async event loop (`main.rs:249`, `main.rs:282`, `main.rs:371`, `main.rs:404`, etc.) — directly on the tokio executor thread. It performs synchronous `std::fs::OpenOptions::new().write(true).create(true).truncate(true)...open()` and `file.write_all()`. This is the same class of bug that was fixed for `app_log()` but `save_cache()` was missed.
 
-**Recommendation**: Share token via `Arc<RwLock<String>>`, refresh on 401, or restart the poller with a fresh token.
+With large caches (thousands of tracks across dozens of playlists), this serialization + write blocks the entire event loop, causing visible UI stuttering.
 
-### H2. Spawned tasks silently swallow all errors
+**Recommendation**: Move `save_cache` to a dedicated thread or use `tokio::task::spawn_blocking`, same pattern as the logger.
 
-**Location**: `events.rs:58-59`, `events.rs:67-69`, `events.rs:107-109`, and ~15 more `tokio::spawn` sites
+### H-2. `load_cache()` performs synchronous file I/O before tokio runtime is ready
 
-All spawned playback commands (`play_track`, `pause_playback`, `seek_playback`, `next_track`, etc.) discard errors with `let _ =`. If a network call fails — e.g., token expired, rate-limited, or device gone — the user sees no feedback. The UI optimistically updates state (e.g., `player.is_playing = !is_playing` at `events.rs:94`) even when the API call fails.
+**Location**: `main.rs:32-39`
 
-**Recommendation**: Route errors back through the `AppMessage` channel and display transient status messages in the TUI.
+Called from `main()` at line 687 before the TUI is initialized. While technically not blocking a tokio thread (it's in the `main` async fn directly), it uses `std::fs::read_to_string` which performs synchronous I/O on the tokio main thread. With a large cache file this delays startup.
 
-### H3. Log file written without restricted permissions
+**Recommendation**: Use `tokio::fs::read_to_string` for consistency and to avoid blocking the runtime.
 
-**Location**: `main.rs:81-88`
+### H-3. Unbounded channel can cause memory exhaustion
 
-`app_log()` opens the log file with `OpenOptions::new().create(true).append(true)` but sets no file permissions. Logs contain API paths, playlist IDs, payload sizes, and status codes. On multi-user systems the default umask may leave logs world-readable.
-
-**Recommendation**: Set `mode(0o600)` on the log file open (matching what's already done for cache/token files).
-
-### H4. Librespot error handler overwrites entire log file
-
-**Location**: `main.rs:570-573`
+**Location**: `main.rs:123`
 
 ```rust
-let _ = std::fs::write(&config::paths().log_file, format!("Librespot error: {}\n", e));
+let (tx, mut rx) = mpsc::unbounded_channel::<AppMessage>();
 ```
 
-Uses `fs::write` which **truncates** the file, destroying all prior log entries. Also lacks `0o600` permissions.
+`AppMessage` variants like `UpdateAlbumArt(String, Vec<u8>)` carry full image byte buffers (typically 50-200KB each). If the UI loop stalls or the consumer falls behind, messages accumulate without bound. A rapid track-change scenario or network flood could exhaust memory.
 
-**Recommendation**: Use `app_log()` instead of `fs::write` for consistency and to preserve log history.
+**Recommendation**: Use a bounded channel (`mpsc::channel(capacity)`) with a reasonable buffer size (e.g., 256), and handle backpressure by dropping stale messages.
+
+### H-4. `spirc_task` JoinHandle is silently dropped
+
+**Location**: `endpoints.rs:325`
+
+```rust
+tokio::spawn(spirc_task);
+```
+
+The Spirc task (librespot's core event loop) is spawned but its JoinHandle is dropped. If this task panics, the error is silently lost and the local player becomes a zombie — commands are sent to a dead channel with no feedback. This task is not covered by the graceful shutdown mechanism (which only tracks the poller handle).
+
+**Recommendation**: Track the `spirc_task` JoinHandle alongside the poller handle. Propagate panic information to the UI.
+
+### H-5. Race condition in token refresh across poller and user-initiated actions
+
+**Location**: `main.rs:155-163` (poller refresh), `events.rs:50` (user action clones)
+
+The poller can refresh the token via `try_refresh_token()` and update its local `current_token` variable, but this new token is never communicated back to `AppState.access_token`. Meanwhile, user-initiated actions in `events.rs` clone from `app_state.access_token` — the stale, expired token. This means:
+
+1. Poller refreshes token → poller works, but...
+2. User presses space → clones old expired token → 401 → "Pause failed" error
+3. User sees error despite poller working fine
+
+**Recommendation**: Share the token via `Arc<RwLock<String>>` so the poller's refresh is visible to all consumers.
 
 ---
 
 ## Medium
 
-### M1. `set_env_var` in tests is unsound
+### M-1. HTTP callback listener accepts first connection without validation
 
-**Location**: `endpoints.rs:811`
+**Location**: `endpoints.rs:177-204`
 
-```rust
-std::env::set_var("SPOTIFY_API_BASE_URL", server.url());
-```
+The OAuth callback listener accepts a single TCP connection and parses it as HTTP with manual string splitting. It does not:
+- Validate that the request is actually HTTP (`GET` method check is minimal)
+- Handle malformed requests gracefully (a port scan would trigger a parse attempt)
+- Close the listener after receiving the callback (it implicitly drops, but the port remains briefly bound)
+- Set `SO_REUSEADDR`, so a crashed previous instance leaves the port occupied for `TIME_WAIT`
 
-`std::env::set_var` is unsound in multi-threaded programs (UB per Rust docs since 1.81). Since tests run in parallel under tokio, this can cause data races.
+**Recommendation**: Add basic HTTP validation. Set socket options. Consider using a lightweight HTTP server (e.g., `axum` on a single endpoint) instead of raw TCP parsing.
 
-**Recommendation**: Use `unsafe { std::env::set_var(...) }` to acknowledge the risk (required since Rust 1.83), or refactor to pass base URL as a parameter rather than using env vars in tests.
+### M-2. Device discovery uses magic string matching
 
-### M2. Dependency vulnerability: `rsa` crate (RUSTSEC-2023-0071)
-
-**Severity**: 5.9 (medium) — Marvin Attack timing side-channel  
-**Source**: `librespot-core 0.8.0 -> rsa 0.9.10`  
-**Status**: No fixed upstream version available
-
-This is a transitive dependency from librespot. The risk is limited since SpotMe doesn't perform RSA operations directly, but librespot uses it for Spotify authentication.
-
-**Recommendation**: Monitor for librespot updates. Consider `[advisories.ignore]` in `audit.toml` with a comment explaining the accepted risk.
-
-### M3. Dependency warning: `paste` crate unmaintained (RUSTSEC-2024-0436)
-
-**Source**: `image -> rav1e -> paste 1.0.15`
-
-Transitive dependency through the image processing chain. No security impact currently but signals maintenance risk.
-
-### M4. Dependency warning: `fastrand 2.4.0` yanked
-
-**Source**: `tempfile -> fastrand 2.4.0` (via librespot chain)
-
-The installed version has been yanked from crates.io. `cargo update` should resolve this.
-
-**Recommendation**: Run `cargo update` to pick up the replacement version.
-
-### M5. No input sanitization on `playlist_id` / `album_id` in URL construction
-
-**Location**: `endpoints.rs:428-429`, `endpoints.rs:543-546`, `endpoints.rs:611`
+**Location**: `endpoints.rs:361`
 
 ```rust
-let url = format!("{}/v1/playlists/{}/items", crate::api::api_base_url(), playlist_id);
+if name == "SpotMe Local Player" {
 ```
 
-While these IDs originate from Spotify's API (not direct user input), a malicious or corrupted cache could inject path traversal or query parameters into the URL. The `track_uri` field has validation (`models.rs:55-61`) but playlist/album IDs do not.
+The device is found by matching the name string `"SpotMe Local Player"` against all devices returned by the Spotify API. If the user has multiple SpotMe instances, renames their device, or another application uses this name, the wrong device (or no device) is selected. The 5-retry loop with 600ms delay (`endpoints.rs:347-374`) blocks for up to 3 seconds on failure with no user feedback.
 
-**Recommendation**: Validate that IDs are alphanumeric before interpolation, consistent with the track URI validation already in `models.rs`.
+**Recommendation**: Store the device ID from Spirc registration rather than relying on name matching. Show a device selection UI if multiple matches are found.
+
+### M-3. `add_track_to_playlist_api` ignores API error response body
+
+**Location**: `events.rs:852-855`
+
+```rust
+let _ = add_track_to_playlist_api(&token, &target_list, &uri).await;
+let _ = tx.send(AppMessage::TrackAddedToPlaylist(target_list));
+```
+
+The result of `add_track_to_playlist_api` is discarded with `let _ =`. The `TrackAddedToPlaylist` message is sent unconditionally — even if the API call failed. The user sees a success state (cache invalidated, view restored) when the track was never actually added.
+
+**Recommendation**: Check the result. Only send `TrackAddedToPlaylist` on success; send `StatusError` on failure.
+
+### M-4. Panic vector in playlist index access
+
+**Location**: `events.rs:392`
+
+```rust
+let playlist = &app_state.filtered_playlists[i];
+```
+
+If `filtered_playlists` is modified between `playlist_state.selected()` returning `Some(i)` and the index access, this panics. While unlikely in single-threaded TUI code, the pattern is fragile — a message handler could modify `filtered_playlists` between key events since the message processing loop runs before event polling.
+
+**Recommendation**: Use `.get(i)` and handle `None` instead of direct indexing.
+
+### M-5. No TLS certificate pinning or validation customization
+
+**Location**: `api/mod.rs:6-16`
+
+The `reqwest::Client` is constructed with default TLS settings. All Spotify API calls and the lrclib.net lyrics call go through whatever the system's certificate store provides. On compromised systems, MITM attacks can intercept tokens.
+
+**Recommendation**: For enterprise deployment, pin Spotify's certificate chain or at minimum enable certificate transparency verification.
+
+### M-6. `futures` dependency declared but unused
+
+**Location**: `Cargo.toml:13`
+
+```toml
+futures = "0.3.32"
+```
+
+Not imported or used anywhere in the source code. Dead dependency increases supply chain attack surface and build times.
+
+**Recommendation**: Remove it.
+
+### M-7. Album art fetched over HTTPS but loaded into memory without size limits
+
+**Location**: `main.rs:131-134`, `main.rs:224-232`
+
+Album art bytes are fetched and stored in `current_art_bytes: Option<Vec<u8>>`. There is no size check. A malicious or corrupted Spotify API response could return a multi-gigabyte payload that exhausts memory. The `image::load_from_memory(&bytes)` call at `main.rs:407` would also attempt to decode an arbitrarily large image.
+
+**Recommendation**: Cap the response body size (e.g., `res.bytes().await` with a Content-Length check, or use `reqwest`'s body size limit).
+
+### M-8. Lyrics timestamp parsing uses string slicing that can panic on non-ASCII
+
+**Location**: `endpoints.rs:834-835`
+
+```rust
+let ts = &line[1..close_idx];
+let text = line[close_idx + 1..].trim().to_string();
+```
+
+These byte-index slices assume ASCII content. If `line` contains multi-byte UTF-8 characters before the `]` bracket, `close_idx` is a byte offset but `line[1..close_idx]` would panic if `1` or `close_idx` falls within a multi-byte character boundary.
+
+**Recommendation**: Use `line.chars()` / `line.char_indices()` instead of byte slicing, or validate ASCII-only content.
+
+### M-9. `test_api_endpoints_mocked` mutates global state (`set_env_var`)
+
+**Location**: `endpoints.rs:912`
+
+Even wrapped in `unsafe`, `set_env_var("SPOTIFY_API_BASE_URL", ...)` mutates process-global state. If tests run in parallel (default Rust test behavior), this can race with other tests or the `api_base_url()` function. The test also never resets the env var, leaving it polluted for subsequent tests.
+
+**Recommendation**: Use `serial_test` crate to enforce sequential execution, or refactor `api_base_url` to accept the base URL as a parameter (dependency injection).
+
+### M-10. Cache file has no integrity verification
+
+**Location**: `main.rs:32-39`
+
+`load_cache()` deserializes the cache file with `serde_json::from_str` and trusts the content entirely. A corrupted or tampered cache file could inject arbitrary playlist IDs and track URIs (which pass the `is_valid_spotify_id` check since it only validates alphanumeric characters). While the impact is limited to the local user, playlist IDs could be crafted to trigger unintended API calls.
+
+**Recommendation**: Add a checksum/HMAC to the cache file.
 
 ---
 
 ## Low
 
-### L1. Unbounded `app_cache.playlists` growth from featured playlists
+### L-1. Duplicate code: "clear player state" pattern repeated 4 times
 
-**Location**: `main.rs:454`
+**Location**: `events.rs:310-316`, `events.rs:563-569`, `events.rs:794-800`, `events.rs:863-869`
+
+The exact same 6-line block (clear player_state, art_protocol, art_bytes, art_url, last_player, save_cache) is copy-pasted in 4 places across different views. Any change (e.g., adding a new field to clear) requires updating all 4 locations.
+
+**Recommendation**: Extract to `AppState::clear_player()` method.
+
+### L-2. Duplicate code: "create optimistic PlayerState" pattern repeated 2 times
+
+**Location**: `events.rs:614-626`, `events.rs:762-774`
+
+Identical `PlayerState` construction for optimistic playback feedback is duplicated in the Tracks and SearchGlobal Enter handlers.
+
+**Recommendation**: Extract to a helper method.
+
+### L-3. Navigation logic (wrapping up/down) duplicated 6 times
+
+**Location**: `events.rs:318-329`, `events.rs:340-351`, `events.rs:574-585`, `events.rs:587-598`, `events.rs:695-708`, `events.rs:710-723`, `events.rs:819-830`, `events.rs:832-843`
+
+The same wrapping navigation pattern is copied across every view. This is ~100 lines of duplicated logic.
+
+**Recommendation**: Extract to a reusable `wrap_navigate(state, len, direction)` function.
+
+### L-4. No timeout on `fetch_playlists_api` pagination
+
+**Location**: `endpoints.rs:487-521`
+
+The `while let Ok(res)` pagination loop has no upper bound on iterations. A malformed API response that always provides a `next` URL would loop forever. Similarly, `fetch_tracks` at `endpoints.rs:525-571` has an unbounded pagination loop.
+
+**Recommendation**: Add a maximum page count (e.g., 100 pages × 50 items = 5000 items max).
+
+### L-5. `format_duration` is not `pub` but used from `ui.rs` via `crate::format_duration`
+
+**Location**: `main.rs:25`
+
+The function is used across module boundaries via `crate::` prefix but isn't explicitly `pub`. It compiles because it's in the crate root, but this pattern fights Rust's visibility conventions.
+
+**Recommendation**: Make it `pub` explicitly, or move it to a shared `utils` module.
+
+### L-6. `GradientBackground` widget performs division that can produce NaN
+
+**Location**: `ui.rs:16`
 
 ```rust
-app_state.app_cache.playlists.extend(lists.clone());
+let factor = 1.0 - ((y - area.top()) as f32 / area.height as f32);
 ```
 
-Each press of `b` (featured playlists) appends up to 50 playlists to the cache without deduplication. Over time this bloats the cache file and slows serialization.
+If `area.height` is 0 (degenerate terminal resize), this divides by zero producing `f32::INFINITY`, and subsequent `as u8` casts produce 0 (saturating), which is visually benign but logically incorrect.
 
-**Recommendation**: Deduplicate by playlist ID before extending, or cap cache size.
+**Recommendation**: Guard against `area.height == 0`.
 
-### L2. Log rotation creates only one `.log.old` backup
+### L-7. `app_state.show_popup` is not reset on many view transitions
 
-**Location**: `main.rs:76-79`
+**Location**: `events.rs:572` (Esc in Tracks sets view to Playlists but doesn't clear show_popup)
 
-When the log exceeds 1MB, it's renamed to `.log.old`, silently overwriting any previous backup. This provides minimal history.
+The `show_popup` flag is set when entering search/queue views but not consistently cleared on all exit paths. This can leave the popup overlay active on the Playlists view if the user navigates back via certain key sequences.
 
-**Recommendation**: Acceptable for a TUI app, but consider numbered rotation (`.log.1`, `.log.2`) if debugging requires historical logs.
+**Recommendation**: Clear `show_popup` on all view-exit transitions.
 
-### L3. CI runs only on `workflow_dispatch` — no automatic triggers
+### L-8. Log messages contain track/artist names — potential PII concern
 
-**Location**: `.github/workflows/ci.yml:4`
-
-CI doesn't run on `push` or `pull_request` events. This means PRs can be merged without passing checks.
-
-**Recommendation**: Add `on: [push, pull_request]` triggers.
-
-### L4. Error messages in UI expose raw API details
-
-**Location**: `endpoints.rs:529`, `endpoints.rs:604`
+**Location**: `endpoints.rs:779-782`
 
 ```rust
-return Err(format!("Bad payload: no items array. {}", json));
+app_log(&format!("FETCH LYRICS INIT: {} - {}", track_name, artist_name));
 ```
 
-Full JSON payloads are included in error messages that may be displayed in the TUI. While this is useful for debugging, it could expose unexpected data.
+Track names and artist names are logged to disk. While not PII in the traditional sense, listening history is considered sensitive data under GDPR Article 9 (data revealing philosophical beliefs) and could be used for profiling.
 
-**Recommendation**: Log the full response but show a user-friendly message in the TUI.
+**Recommendation**: For enterprise/GDPR compliance, hash or omit track-specific data from logs.
+
+### L-9. No `deny(unsafe_code)` lint at crate level
+
+The crate uses `unsafe` (for `set_env_var` in tests) but doesn't declare `#![deny(unsafe_code)]` at the crate level. This means future contributors can introduce unsafe code without a linting gate.
+
+**Recommendation**: Add `#![deny(unsafe_code)]` to `main.rs` and `#[allow(unsafe_code)]` only on the specific test function.
+
+### L-10. Librespot spawned without shutdown coordination
+
+**Location**: `main.rs:669-675`
+
+The librespot daemon is spawned as a fire-and-forget `tokio::spawn`. When the app exits via the graceful shutdown path (`main.rs:657-664`), only the poller handle is awaited. The librespot Spirc task, its session, and the audio backend are abandoned — potentially leaving audio resources open or buffer data unflushed.
+
+**Recommendation**: Track the librespot handle and include it in the shutdown sequence.
+
+### L-11. Test coverage is minimal (9 tests for ~4,200 LOC)
+
+**Coverage**: ~0.2% path coverage. The test suite covers:
+- Duration formatting (1 test)
+- Config singleton (1 test)  
+- Track parsing (3 tests)
+- One mocked API call (1 test)
+- State debounce (1 test)
+- Event handling (2 tests)
+
+Not tested: OAuth flow, token refresh, playback commands, cache serialization round-trip, error propagation, UI rendering, lyrics parsing, backoff logic, shutdown sequence, device discovery.
+
+**Recommendation**: Target ≥60% line coverage. Add integration tests with mockito for all API endpoints. Add property-based tests for parsing logic. Test error propagation paths.
 
 ---
 
-## Positive Findings
+## Informational / Positive Findings
 
-- **PKCE OAuth2 correctly implemented** — 32-byte random verifier, SHA-256 challenge, no client secret required (`endpoints.rs:72-87`)
-- **All Spotify API calls over HTTPS** with Bearer token auth
-- **Track URI validation** is thorough — checks prefix, length, and character set (`models.rs:55-61`)
-- **Token and cache files use `0o600` permissions** on Unix (`main.rs:46-57`, `endpoints.rs:52-59`)
-- **`.env` and sensitive files correctly `.gitignore`d**
-- **Shared HTTP client** via `OnceLock` with 30s timeout (`api/mod.rs:6-16`)
-- **Lyrics API has dedicated 5s timeout** to avoid blocking the UI (`endpoints.rs:708`)
-- **Search input capped at 200 characters** (`events.rs:406`, `events.rs:616`)
-- **Debounce logic** prevents UI state from being overwritten by stale API responses (`state.rs:112-145`)
-- **Clean clippy** — zero warnings
-- **9 unit tests passing** with mockito HTTP mocking
-- **Well-structured async architecture** with channel-based message passing
-- **Log size capped at 1MB** with basic rotation (`main.rs:76-79`)
+1. **PKCE OAuth correctly implemented** — SHA-256 challenge with 32-byte verifier, CSRF state parameter validated
+2. **Token cache uses `0o600` permissions** consistently across all write paths on Unix
+3. **URI validation is thorough** — prefix, length, and character set checks in `parse_track`
+4. **Exponential backoff with 429 handling** — properly reads Retry-After header, caps at 30s
+5. **Non-blocking logger** — channel-based, dedicated writer thread
+6. **Domain error enum** — `SpotifyApiError` via `thiserror` for typed error propagation
+7. **Status error feedback** — playback failures now surface to the user in the TUI
+8. **Graceful shutdown signal** — watch channel notifies poller, handles awaited with timeout
+9. **Input bounds** — search capped at 200 chars, IDs validated before URL interpolation
+10. **Clean clippy** — zero warnings under `-D warnings`
+11. **Debounce logic** prevents API lag from overwriting local state during active user interaction
 
 ---
 
-## Resolved Since Last Audit
+## Dependency Risk Matrix
 
-| Prior Issue | Status |
-|---|---|
-| Token cache file permissions inconsistent | **Resolved** — `0o600` now enforced in both `main.rs:save_cache()` and `endpoints.rs` token writes |
-| Unbounded search input | **Resolved** — 200-char cap added in `events.rs:406` and `events.rs:616` |
-| No URI format validation | **Resolved** — `models.rs:55-61` validates `spotify:track:` prefix, length, and alphanumeric ID |
-| No CI/CD pipeline | **Partially resolved** — CI exists with fmt/clippy/test/audit, but only triggers on `workflow_dispatch` |
-| Third-party lyrics API timeout | **Resolved** — 5s timeout added at `endpoints.rs:708` |
+| Crate | Risk | Notes |
+|-------|------|-------|
+| `rsa` 0.9.10 | **MEDIUM** | RUSTSEC-2023-0071 Marvin Attack — transitive via librespot, no fix available |
+| `paste` 1.0.15 | **LOW** | Unmaintained (RUSTSEC-2024-0436) — transitive via image chain |
+| `librespot` 0.8.0 | **MEDIUM** | Git dependency from main branch — no pinned commit hash in Cargo.toml, could shift |
+| `futures` 0.3.32 | **LOW** | Unused — unnecessary supply chain surface |
+
+---
+
+## Summary of Required Actions (Priority Order)
+
+1. **Rotate Spotify credentials immediately** — secret is in `.env`
+2. **Remove client secret from `.env`** — PKCE doesn't need it
+3. **Make `save_cache` non-blocking** — same fix pattern as `app_log`
+4. **Share refreshed token with user-action paths** — Arc<RwLock<String>>
+5. **Track librespot JoinHandle in shutdown** — currently abandoned
+6. **Fix `add_track_to_playlist` false success** — check result before confirming
+7. **Bound the message channel** — prevent OOM under backpressure
+8. **Remove unused `futures` dependency**
+9. **Extract duplicated code** (clear player, navigation, optimistic state)
+10. **Add pagination limits** to prevent infinite fetch loops
+11. **Increase test coverage** to ≥60% line coverage
